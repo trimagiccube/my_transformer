@@ -10,3 +10,4 @@ runcuda
 *.exp
 *.lib
 *.bin
+tags

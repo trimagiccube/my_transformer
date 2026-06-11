@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>llama2.cu · Transformer 推理全流程可视化</title>
+<style>
+  :root{
+    --bg:#070b16; --bg2:#0c1322; --panel:#0f1a2e; --panel2:#13213a;
+    --line:#1e2d49; --text:#dce6f5; --muted:#8497b8; --dim:#5c6f92;
+    --cpu:#f5a623; --cublas:#a855f7; --kernel:#22d3ee; --kernel2:#34d399;
+    --kv:#f472b6; --accent:#38bdf8; --danger:#fb7185;
+    --code-bg:#0a1120;
+    --mono:'SF Mono','JetBrains Mono','Fira Code',Consolas,Menlo,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.7;
+    background-image:radial-gradient(900px 600px at 80% -10%,rgba(56,189,248,.10),transparent),
+                     radial-gradient(700px 500px at 0% 10%,rgba(168,85,247,.08),transparent);
+    background-attachment:fixed;}
+  a{color:var(--accent);text-decoration:none}
+  ::selection{background:rgba(56,189,248,.3)}
+
+  /* ---- nav ---- */
+  nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(12px);
+    background:rgba(7,11,22,.82);border-bottom:1px solid var(--line);}
+  .nav-in{max-width:1180px;margin:0 auto;padding:12px 24px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+  .brand{font-family:var(--mono);font-weight:700;font-size:15px;color:#fff;letter-spacing:.5px}
+  .brand span{color:var(--kernel)}
+  .nav-links{display:flex;gap:4px;flex-wrap:wrap;margin-left:auto}
+  .nav-links a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:7px;transition:.2s}
+  .nav-links a:hover{color:#fff;background:var(--panel2)}
+
+  .wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+  section{padding:64px 0;border-bottom:1px solid rgba(30,45,73,.4)}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:2px;text-transform:uppercase;color:var(--accent);margin-bottom:10px}
+  h1{font-size:clamp(30px,5vw,52px);line-height:1.1;font-weight:800;letter-spacing:-1px;color:#fff}
+  h2{font-size:clamp(24px,3.5vw,34px);font-weight:750;letter-spacing:-.5px;color:#fff;margin-bottom:6px}
+  h3{font-size:19px;font-weight:700;color:#fff;margin-bottom:8px}
+  .lead{font-size:18px;color:var(--muted);max-width:760px}
+  p.note{color:var(--muted);max-width:820px;margin-top:10px}
+  code.inl{font-family:var(--mono);font-size:.88em;background:var(--panel2);padding:2px 7px;border-radius:5px;color:#bfe7ff;border:1px solid var(--line)}
+
+  /* ---- hero ---- */
+  .hero{padding:90px 0 70px}
+  .hero h1{margin-bottom:18px}
+  .grad{background:linear-gradient(100deg,#38bdf8,#a855f7 55%,#f472b6);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .chips{display:flex;gap:10px;flex-wrap:wrap;margin-top:30px}
+  .chip{font-family:var(--mono);font-size:12.5px;background:var(--panel);border:1px solid var(--line);
+    padding:8px 13px;border-radius:9px;color:var(--text);display:flex;gap:7px;align-items:center}
+  .chip b{color:var(--kernel)}
+  .chip .k{color:var(--dim)}
+  .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-family:var(--mono);
+    padding:3px 9px;border-radius:20px;border:1px solid}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:none}
+
+  /* ---- legend ---- */
+  .legend{display:flex;gap:22px;flex-wrap:wrap;margin-top:26px;padding:16px 20px;background:var(--panel);border:1px solid var(--line);border-radius:12px}
+  .legend .item{display:flex;align-items:center;gap:9px;font-size:13.5px}
+  .legend .item small{color:var(--dim);font-family:var(--mono)}
+
+  /* ---- pipeline overview (SVG-ish flow) ---- */
+  .flow{display:flex;flex-direction:column;gap:0;margin-top:34px}
+  .flow .stage{display:flex;align-items:stretch;gap:0}
+  .flow .arrow{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:6px 0;color:var(--dim)}
+  .flow .arrow svg{opacity:.6}
+  .frow{display:grid;grid-template-columns:1fr;gap:14px}
+
+  /* ---- stage card ---- */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;transition:.25s}
+  .card:hover{border-color:#2c4368}
+  .card.open{border-color:var(--accent);box-shadow:0 0 0 1px rgba(56,189,248,.25),0 14px 40px -18px rgba(56,189,248,.4)}
+  .card-head{display:flex;align-items:center;gap:14px;padding:16px 18px;cursor:pointer;user-select:none}
+  .card-head:hover{background:var(--panel2)}
+  .idx{font-family:var(--mono);font-size:13px;width:30px;height:30px;flex:none;border-radius:8px;
+    display:grid;place-items:center;background:var(--bg2);border:1px solid var(--line);color:var(--muted)}
+  .card-title{flex:1}
+  .card-title .t{font-weight:700;font-size:16px;color:#fff}
+  .card-title .s{font-size:13px;color:var(--muted)}
+  .tag{font-family:var(--mono);font-size:11px;padding:4px 9px;border-radius:7px;border:1px solid;white-space:nowrap}
+  .tag.cpu{color:var(--cpu);border-color:rgba(245,166,35,.4);background:rgba(245,166,35,.08)}
+  .tag.cublas{color:var(--cublas);border-color:rgba(168,85,247,.4);background:rgba(168,85,247,.08)}
+  .tag.kernel{color:var(--kernel);border-color:rgba(34,211,238,.4);background:rgba(34,211,238,.08)}
+  .tag.kv{color:var(--kv);border-color:rgba(244,114,182,.4);background:rgba(244,114,182,.08)}
+  .chev{color:var(--dim);transition:.25s;flex:none}
+  .card.open .chev{transform:rotate(90deg);color:var(--accent)}
+
+  .card-body{max-height:0;overflow:hidden;transition:max-height .4s ease}
+  .card.open .card-body{max-height:2600px}
+  .body-in{padding:4px 18px 20px;display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:780px){.body-in{grid-template-columns:1fr}}
+  .col h4{font-size:12px;font-family:var(--mono);letter-spacing:1px;text-transform:uppercase;color:var(--dim);margin-bottom:9px;display:flex;align-items:center;gap:7px}
+  .col p{font-size:14.5px;color:var(--muted)}
+  .col p+p{margin-top:8px}
+  .formula{font-family:var(--mono);font-size:13.5px;background:var(--bg2);border:1px solid var(--line);
+    border-radius:8px;padding:10px 13px;color:#cfe9ff;margin:10px 0;overflow-x:auto;white-space:nowrap}
+
+  /* ---- code block ---- */
+  pre{background:var(--code-bg);border:1px solid var(--line);border-radius:9px;padding:13px 15px;overflow-x:auto;
+    font-family:var(--mono);font-size:12.7px;line-height:1.65}
+  pre .cm{color:#5c7099}      /* comment */
+  pre .kw{color:#c792ea}      /* keyword */
+  pre .fn{color:#82aaff}      /* function */
+  pre .num{color:#f78c6c}     /* number */
+  pre .str{color:#c3e88d}     /* string */
+  pre .ker{color:#22d3ee;font-weight:600} /* <<< >>> */
+  pre .ty{color:#ffcb6b}      /* type */
+  .codecap{font-family:var(--mono);font-size:11.5px;color:var(--dim);margin:8px 0 4px}
+
+  /* ---- dispatch viz ---- */
+  .dispatch{background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:13px 15px;margin-top:10px}
+  .dispatch .row{display:flex;justify-content:space-between;font-size:13px;padding:4px 0;border-bottom:1px dashed rgba(30,45,73,.6)}
+  .dispatch .row:last-child{border:0}
+  .dispatch .row .l{color:var(--muted)}
+  .dispatch .row .v{font-family:var(--mono);color:#bfe7ff}
+  .gridviz{display:flex;gap:3px;flex-wrap:wrap;margin-top:12px;align-items:flex-end}
+  .blk{width:14px;height:14px;border-radius:3px;background:linear-gradient(160deg,var(--kernel),var(--kernel2));opacity:.85}
+  .blk.med{background:linear-gradient(160deg,#34d399,#22d3ee)}
+  .blk.lib{background:linear-gradient(160deg,var(--cublas),#7c3aed)}
+  .gridviz small{width:100%;font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:6px}
+
+  /* ---- layer stepper ---- */
+  .stepper{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:24px 0 8px}
+  .btn{font-family:var(--mono);font-size:13px;background:var(--panel2);border:1px solid var(--line);
+    color:var(--text);padding:9px 16px;border-radius:9px;cursor:pointer;transition:.2s}
+  .btn:hover{border-color:var(--accent);color:#fff}
+  .layerbar{display:flex;gap:6px;flex:1;min-width:200px}
+  .lcell{flex:1;height:8px;border-radius:4px;background:var(--panel2);transition:.3s}
+  .lcell.on{background:linear-gradient(90deg,var(--accent),var(--cublas))}
+  #layerLabel{font-family:var(--mono);font-size:13px;color:var(--accent)}
+
+  /* ---- gpu model ---- */
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+  @media(max-width:780px){.grid2{grid-template-columns:1fr}}
+  .ibox{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:20px 22px}
+  .ibox h3{display:flex;align-items:center;gap:9px}
+  .ibox ul{margin:10px 0 0 2px;list-style:none}
+  .ibox li{font-size:14px;color:var(--muted);padding:6px 0 6px 20px;position:relative}
+  .ibox li:before{content:'▸';position:absolute;left:0;color:var(--accent)}
+  .ibox li b{color:var(--text)}
+
+  table{width:100%;border-collapse:collapse;margin-top:14px;font-size:13.5px}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-family:var(--mono);font-size:11.5px;letter-spacing:1px;text-transform:uppercase}
+  td{color:var(--muted)} td b{color:var(--text)}
+  td .mono,th .mono{font-family:var(--mono)}
+
+  footer{padding:46px 0;text-align:center;color:var(--dim);font-size:13px}
+  .reveal{opacity:0;transform:translateY(22px);transition:.6s cubic-bezier(.2,.7,.2,1)}
+  .reveal.in{opacity:1;transform:none}
+  .kbd{font-family:var(--mono);font-size:11px;background:var(--bg2);border:1px solid var(--line);border-radius:5px;padding:2px 6px;color:var(--muted)}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-in">
+    <div class="brand">llama2<span>.cu</span> · 推理全流程</div>
+    <div class="nav-links">
+      <a href="#overview">总览</a>
+      <a href="#pipeline">流水线</a>
+      <a href="#layer">解码层内部</a>
+      <a href="#gpu">GPU 执行模型</a>
+      <a href="#dispatch">调度速查</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero wrap">
+  <div class="eyebrow">从一行 prompt 到下一个 token · run.cu 逐阶段拆解</div>
+  <h1>Transformer 推理<br>在 GPU 上<span class="grad">到底怎么算</span></h1>
+  <p class="lead">本页用 <code class="inl">~/llama2.cu/run.cu</code> 的真实代码,把 Transformer 推理的每一个阶段
+  ——分词 → 嵌入 → 注意力 → 前馈 → 采样——拆开,告诉你<b>每一步对应哪段代码</b>、<b>怎么丢给 GPU 算</b>(grid / block 怎么分)、以及数据形状如何流动。</p>
+
+  <div class="chips" id="cfgChips">
+    <div class="chip"><span class="k">model</span> <b>stories15M</b></div>
+    <div class="chip"><span class="k">dim</span> <b>288</b></div>
+    <div class="chip"><span class="k">layers</span> <b>6</b></div>
+    <div class="chip"><span class="k">heads</span> <b>6</b></div>
+    <div class="chip"><span class="k">head_size</span> <b>48</b></div>
+    <div class="chip"><span class="k">hidden</span> <b>768</b></div>
+    <div class="chip"><span class="k">vocab</span> <b>32000</b></div>
+    <div class="chip"><span class="k">seq_len</span> <b>256</b></div>
+    <div class="chip"><span class="k">dtype</span> <b>fp32</b></div>
+  </div>
+
+  <div class="legend">
+    <div class="item"><span class="dot" style="background:var(--cpu)"></span> <span>CPU 上执行</span> <small>主机循环 / 分词 / 采样</small></div>
+    <div class="item"><span class="dot" style="background:var(--cublas)"></span> <span>cuBLAS 库</span> <small>所有矩阵乘 (Sgemv)</small></div>
+    <div class="item"><span class="dot" style="background:var(--kernel)"></span> <span>自写 CUDA kernel</span> <small>norm/rope/attn/silu/...</small></div>
+    <div class="item"><span class="dot" style="background:var(--kv)"></span> <span>KV Cache</span> <small>显存中的历史 K/V</small></div>
+  </div>
+</header>
+
+<!-- ================= OVERVIEW ================= -->
+<section id="overview" class="wrap reveal">
+  <div class="eyebrow">Big Picture</div>
+  <h2>一次前向 = 把一个 token 变成 32000 个 logit</h2>
+  <p class="note">推理是<b>自回归</b>的:每次只喂入 <i>1 个</i> token,经过 6 个解码层算出词表上每个词的分数(logits),采样得到下一个 token,再喂回去。下面是 <code class="inl">forward()</code>(run.cu:623)的完整骨架——注意它<b>只有 6 类 GPU 操作</b>反复组合。</p>
+
+  <div class="grid2" style="margin-top:24px">
+    <div class="ibox">
+      <h3><span class="dot" style="background:var(--accent)"></span> 计算的 6 块积木</h3>
+      <ul>
+        <li><b>RMSNorm</b> — 归一化,自写 kernel(CUB 归约)</li>
+        <li><b>MatMul</b> — 所有线性层,交给 <b style="color:var(--cublas)">cuBLAS</b></li>
+        <li><b>RoPE</b> — 旋转位置编码,自写 kernel</li>
+        <li><b>Attention</b> — 打分+softmax+加权,自写 kernel,读写 <b style="color:var(--kv)">KV Cache</b></li>
+        <li><b>SwiGLU</b> — 前馈激活,自写 kernel</li>
+        <li><b>Accum</b> — 残差相加,自写 kernel</li>
+      </ul>
+    </div>
+    <div class="ibox">
+      <h3><span class="dot" style="background:var(--cpu)"></span> 数据在哪</h3>
+      <ul>
+        <li><b>权重</b>:启动时 <code class="inl">mmap</code> + 一次性 <code class="inl">cudaMemcpy</code> 全部搬上显存,常驻 GPU</li>
+        <li><b>激活值 (x, xb, q, k, v, att, hb...)</b>:全部在显存,层与层之间不回主机</li>
+        <li><b>KV Cache</b>:显存里一块 <span class="mono">[layer][seq][kv_dim]</span> 大数组,每步写入当前位置</li>
+        <li><b>每步唯一的主机↔设备拷贝</b>:开头拷 1 行 embedding 上去,结尾把 logits 拷回来采样</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ================= PIPELINE ================= -->
+<section id="pipeline" class="wrap reveal">
+  <div class="eyebrow">The Pipeline · 点击任意阶段展开</div>
+  <h2>完整流水线(逐阶段)</h2>
+  <p class="note">按执行顺序排列。中间 <b>① ~ ⑪</b> 是<b>一个解码层内部</b>的步骤,会重复 <b>6 次</b>(每层一次)。点开看「Transformer 概念 / 真实代码 / GPU 调度」三栏对照。</p>
+  <div id="pipeline-list" style="margin-top:28px;display:flex;flex-direction:column;gap:12px"></div>
+</section>
+
+<!-- ================= LAYER STEPPER ================= -->
+<section id="layer" class="wrap reveal">
+  <div class="eyebrow">Decoder Layer · 动手走一遍</div>
+  <h2>解码层内部:数据形状如何流动</h2>
+  <p class="note">点「下一步 ▶」逐步推进一个解码层的 11 个操作,观察张量形状(以 stories15M:dim=288, hidden=768, head=6×48 为例)如何变化。</p>
+
+  <div class="stepper">
+    <button class="btn" id="prevStep">◀ 上一步</button>
+    <button class="btn" id="nextStep">下一步 ▶</button>
+    <div class="layerbar" id="layerbar"></div>
+    <div id="layerLabel">步骤 0 / 11</div>
+  </div>
+  <div class="card open" style="border-color:var(--accent)">
+    <div class="body-in" id="stepBody" style="max-height:none"></div>
+  </div>
+</section>
+
+<!-- ================= GPU MODEL ================= -->
+<section id="gpu" class="wrap reveal">
+  <div class="eyebrow">CUDA Execution Model</div>
+  <h2>"丢给 GPU 算" 到底是什么意思</h2>
+  <p class="note">CPU 端代码长这样:<code class="inl">kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(args)</code>。三个尖括号告诉 GPU 启动多少个并行线程,以及怎么分组。理解这个就理解了全部"调度"。</p>
+
+  <div class="grid2" style="margin-top:22px">
+    <div class="ibox">
+      <h3>两个常数决定一切</h3>
+      <p style="color:var(--muted);font-size:14px;margin-top:6px">run.cu 全局只用两种线程块大小:</p>
+      <div class="formula">const int num_threads_lrg = 1024; <span style="color:var(--dim)">// 大</span></div>
+      <div class="formula">const int num_threads_med = 256;  <span style="color:var(--dim)">// 中</span></div>
+      <ul style="margin-top:14px">
+        <li><b>grid</b> = 启动多少个 <b>线程块 (block)</b>。常按"输出有多少个独立单元"来定,比如注意力按 <span class="mono">n_heads</span> 个头分块。</li>
+        <li><b>block</b> = 每块多少 <b>线程 (thread)</b>。块内线程能共享内存 + 同步,用来做<b>归约</b>(求和/求最大)。</li>
+      </ul>
+    </div>
+    <div class="ibox">
+      <h3>两种并行模式</h3>
+      <ul>
+        <li><b style="color:var(--kernel)">逐元素型</b>(silu / accum):每个线程管一个元素,<span class="mono">grid=divUp(N,256)</span>,无需通信。简单粗暴。</li>
+        <li><b style="color:var(--kernel)">归约型</b>(rmsnorm / softmax / attention):一个 block 内 1024 个线程<b>协作</b>处理一个向量/一个头,用 <code class="inl">cub::BlockReduce</code> 把 1024 个部分和合成一个总和。</li>
+        <li><b style="color:var(--cublas)">矩阵乘</b>:不自己写,调 <code class="inl">cublasSgemv</code>。因为 GEMM 想写快极难,库已是性能天花板。</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="ibox" style="margin-top:20px">
+    <h3>例:多头注意力的线程分工 <span class="tag kernel" style="margin-left:8px">multi_head_attention_kernel&lt;&lt;&lt;6, 1024&gt;&gt;&gt;</span></h3>
+    <p style="color:var(--muted);font-size:14px;margin:8px 0 4px">启动 <b>6 个 block</b>(每个头一块),每块 <b>1024 个线程</b>协作:</p>
+    <table>
+      <tr><th>谁</th><th>干什么</th><th>怎么并行</th></tr>
+      <tr><td><b>blockIdx.x</b> <span class="mono">(0~5)</span></td><td>负责第 h 个注意力头</td><td>6 个头完全独立 → 6 个 block 同时跑</td></tr>
+      <tr><td><b>threadIdx.x</b> <span class="mono">(0~1023)</span></td><td>算 q·k 打分:线程 t 负责第 t、t+1024… 个历史位置</td><td>块内线程分摊 pos+1 个时间步</td></tr>
+      <tr><td><b>__syncthreads</b></td><td>等所有分数算完 → 块内 softmax → 再加权求 value</td><td>共享内存 + 同步完成归约</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ================= DISPATCH TABLE ================= -->
+<section id="dispatch" class="wrap reveal">
+  <div class="eyebrow">Cheat Sheet</div>
+  <h2>GPU 调度速查表</h2>
+  <p class="note">forward() 里每个操作的 launch 配置一览。<span class="mono">d=dim=288, h=hidden=768, H=n_heads=6</span>。</p>
+  <table style="margin-top:18px">
+    <tr><th>阶段</th><th>实现</th><th>Launch 配置</th><th>线程在做什么</th></tr>
+    <tr><td><b>Embedding 拷贝</b></td><td><span class="tag cpu">cudaMemcpy</span></td><td class="mono">H2D, dim 个 float</td><td>把一行词向量搬上显存</td></tr>
+    <tr><td><b>RMSNorm</b></td><td><span class="tag kernel">rmsnorm_kernel</span></td><td class="mono">&lt;&lt;&lt;1, 1024&gt;&gt;&gt;</td><td>1024 线程归约平方和,再缩放</td></tr>
+    <tr><td><b>QKV / O / FFN 投影</b></td><td><span class="tag cublas">cublasSgemv</span></td><td class="mono">CUBLAS_OP_T</td><td>矩阵×向量,库内部调度</td></tr>
+    <tr><td><b>RoPE</b></td><td><span class="tag kernel">RoPe_rotation_kernel</span></td><td class="mono">&lt;&lt;&lt;1, dim/2&gt;&gt;&gt;</td><td>每线程旋转一对 (q,k) 分量</td></tr>
+    <tr><td><b>Multi-Head Attn</b></td><td><span class="tag kernel">multi_head_attention_kernel</span></td><td class="mono">&lt;&lt;&lt;H, 1024&gt;&gt;&gt;</td><td>每 block 一个头:打分→softmax→加权</td></tr>
+    <tr><td><b>残差相加</b></td><td><span class="tag kernel">accum_kernel</span></td><td class="mono">&lt;&lt;&lt;⌈d/256⌉, 256&gt;&gt;&gt;</td><td>逐元素 a[i]+=b[i]</td></tr>
+    <tr><td><b>SwiGLU</b></td><td><span class="tag kernel">f_silu_..._mul_w3</span></td><td class="mono">&lt;&lt;&lt;⌈h/256⌉, 256&gt;&gt;&gt;</td><td>逐元素 silu(w1)·w3</td></tr>
+    <tr><td><b>Classifier</b></td><td><span class="tag cublas">cublasSgemv</span></td><td class="mono">dim → 32000</td><td>投影到词表得 logits</td></tr>
+    <tr><td><b>Logits 回传</b></td><td><span class="tag cpu">cudaMemcpy</span></td><td class="mono">D2H, vocab 个 float</td><td>搬回主机供采样</td></tr>
+    <tr><td><b>采样</b></td><td><span class="tag cpu">sample()</span></td><td class="mono">CPU</td><td>温度 / top-p / argmax 选 token</td></tr>
+  </table>
+  <p class="note" style="margin-top:20px">⚠️ <b>注意这个朴素实现的关键特征</b>:每个操作都是<b>独立 kernel 启动</b>(launch 一次、回来、再 launch 下一个)。这正是它好读的原因,也是它和你 <code class="inl">~/infer</code> 项目的根本差异——后者把 RMSNorm+QKV+RoPE+KVCache <b>融合成一个 kernel</b>,省掉中间的显存往返和启动开销,换取极致性能(但极难读)。</p>
+</section>
+
+<footer>
+  <p>基于 <b>~/llama2.cu/run.cu</b> 实测代码生成 · 配置取自 stories15M.bin 文件头</p>
+  <p style="margin-top:6px">交互提示:点击流水线卡片展开三栏对照 · 用解码层 stepper 逐步观察形状流动</p>
+</footer>
+
+<script>
+/* ============ 数据:流水线各阶段 ============ */
+const STAGES = [
+  {idx:'A', kind:'cpu', tag:'CPU · encode()', title:'分词 Tokenize', sub:'字符串 → token id 序列 (BPE)',
+   concept:'Transformer 不认字符,只认整数 id。BPE 分词器把 prompt 切成子词,查表得到 id。开头补一个 BOS(=1)。',
+   formula:'"Once upon" → [1, 9038, 2501, ...]',
+   code:`<span class="cm">// generate(): 把 prompt 编码成 token 序列</span>
+<span class="ty">int</span>* prompt_tokens = <span class="fn">malloc</span>(...);
+<span class="fn">encode</span>(tokenizer, prompt, <span class="num">1</span><span class="cm">/*BOS*/</span>, <span class="num">0</span>, prompt_tokens, &n);
+<span class="ty">int</span> token = prompt_tokens[<span class="num">0</span>];  <span class="cm">// 第一个喂进去的 token</span>`,
+   disp:[['执行位置','主机 CPU'],['算法','贪心 BPE 合并'],['输出','int[] token 序列']], viz:null},
+
+  {idx:'B', kind:'cpu', tag:'CPU→GPU · cudaMemcpy', title:'词嵌入 Embedding', sub:'token id → dim 维向量,搬上显存',
+   concept:'用 token id 在嵌入表里查出对应的 288 维向量,作为这一步的初始隐藏状态 x。这是每步唯一一次"喂数据上 GPU"。',
+   formula:'x = embedding_table[token]   // shape: [288]',
+   code:`<span class="cm">// forward(): 取出该 token 的词向量那一行</span>
+<span class="ty">float</span>* content_row = w->token_embedding_table + token*dim;
+<span class="fn">cudaMemcpy</span>(x, content_row, dim*<span class="kw">sizeof</span>(<span class="ty">float</span>),
+           cudaMemcpyHostToDevice);  <span class="cm">// 拷 288 个 float 上显存</span>`,
+   disp:[['方向','Host → Device'],['大小','dim=288 个 float'],['结果','x 驻留显存']], viz:null},
+
+  {idx:'①', kind:'kernel', tag:'kernel · rmsnorm', title:'注意力前 RMSNorm', sub:'归一化隐藏状态(pre-norm)',
+   concept:'进入注意力前先归一化。RMSNorm 比 LayerNorm 简单:只按均方根缩放,不减均值。Llama 用的就是它。',
+   formula:'x̂ = x / sqrt(mean(x²)+ε) · weight',
+   code:`<span class="kw">__global__</span> <span class="kw">void</span> <span class="fn">rmsnorm_kernel</span>(<span class="ty">float</span>* o,<span class="ty">float</span>* x,<span class="ty">float</span>* w,...){
+  <span class="ty">float</span> ss=<span class="num">0</span>; <span class="cm">// 每线程累加自己负责元素的平方</span>
+  <span class="kw">for</span>(...) ss += x[j]*x[j];
+  <span class="cm">// 1024 线程的部分和 → CUB 归约成总和</span>
+  ss = <span class="fn">BlockReduce</span>(temp).<span class="fn">Sum</span>(ss);
+  <span class="kw">if</span>(threadIdx.x==<span class="num">0</span>) ss = <span class="num">1.0f</span>/<span class="fn">sqrtf</span>(ss/size+<span class="num">1e-5f</span>);
+  __syncthreads();
+  <span class="kw">for</span>(...) o[j] = w[j]*(ss*x[j]); <span class="cm">// 缩放</span>
+}
+<span class="fn">rmsnorm_kernel</span> <span class="ker">&lt;&lt;&lt;1, 1024&gt;&gt;&gt;</span> (o,x,w,size,perThread);`,
+   disp:[['grid','1 block'],['block','1024 threads'],['模式','块内归约 (CUB BlockReduce)']],
+   viz:{n:1,cls:'',label:'1 个 block × 1024 线程协作归约一个向量'}},
+
+  {idx:'②', kind:'cublas', tag:'cuBLAS · Sgemv ×3', title:'QKV 投影', sub:'x̂ → query / key / value',
+   concept:'用三个权重矩阵把归一化后的向量投影成 Q、K、V。这是纯矩阵乘,直接交给 cuBLAS。K、V 同时写进 KV Cache 的当前位置。',
+   formula:'q = Wq·x̂   k = Wk·x̂   v = Wv·x̂',
+   code:`<span class="cm">// k,v 指针直接指向 KV cache 中 pos 的位置 → 算完即缓存</span>
+s->k = s->key_cache  + loff + pos*kv_dim;
+s->v = s->value_cache+ loff + pos*kv_dim;
+
+<span class="fn">matmul</span>(s->q, s->xb, w->wq + l*dim*dim,  dim, dim);
+<span class="fn">matmul</span>(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+<span class="fn">matmul</span>(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+
+<span class="cm">// matmul 内部就是一行 cuBLAS:</span>
+<span class="fn">cublasSgemv</span>(handle, CUBLAS_OP_T, n, d, &a, w,n, x,<span class="num">1</span>, &b, xout,<span class="num">1</span>);`,
+   disp:[['实现','cuBLAS cublasSgemv'],['转置','CUBLAS_OP_T (权重按行存)'],['副作用','K/V 写入 KV Cache']],
+   viz:{n:6,cls:'lib',label:'cuBLAS 内部自行调度(示意)'}},
+
+  {idx:'③', kind:'kernel', tag:'kernel · RoPE', title:'旋转位置编码 RoPE', sub:'把位置信息"旋转"进 q、k',
+   concept:'Transformer 本身不知道词的先后。RoPE 按位置 pos 给 q、k 的每一对分量施加一个旋转,角度随位置和维度变化——这样点积时就自带相对位置信息。',
+   formula:'[q₀,q₁] → [q₀cosθ−q₁sinθ, q₀sinθ+q₁cosθ]',
+   code:`<span class="kw">__global__</span> <span class="kw">void</span> <span class="fn">RoPe_rotation_kernel</span>(<span class="ty">int</span> pos,<span class="ty">float</span>*sq,<span class="ty">float</span>*sk,...){
+  <span class="ty">int</span> i = threadIdx.x*<span class="num">2</span>;        <span class="cm">// 每线程管一对分量</span>
+  <span class="ty">float</span> freq = <span class="num">1.0f</span>/<span class="fn">powf</span>(<span class="num">10000.0f</span>, (i%head_size)/(<span class="ty">float</span>)head_size);
+  <span class="ty">float</span> fcr=<span class="fn">cosf</span>(pos*freq), fci=<span class="fn">sinf</span>(pos*freq);
+  <span class="cm">// 同时旋转 q 和 k(k 还要 < kv_dim)</span>
+  vec[i]   = v0*fcr - v1*fci;
+  vec[i+<span class="num">1</span>] = v0*fci + v1*fcr;
+}
+<span class="fn">RoPe_rotation_kernel</span> <span class="ker">&lt;&lt;&lt;1, dim/2&gt;&gt;&gt;</span> (pos, s->q, s->k,...);`,
+   disp:[['grid','1 block'],['block','dim/2 = 144 threads'],['模式','逐对旋转,线程间无依赖']],
+   viz:{n:1,cls:'',label:'1 block × 144 线程,各转一对 (q,k)'}},
+
+  {idx:'④', kind:'kv', tag:'kernel · attention', title:'多头自注意力', sub:'打分 → softmax → 加权求和',
+   concept:'核心步骤。当前 q 与缓存里所有历史 k 做点积得到注意力分数,缩放后 softmax 成权重,再用权重对所有历史 v 加权求和。每个头独立。读的就是 KV Cache。',
+   formula:'out = softmax(q·Kᵀ / √head_size) · V',
+   code:`<span class="kw">__global__</span> <span class="kw">void</span> <span class="fn">multi_head_attention_kernel</span>(...){
+  <span class="ty">int</span> h = blockIdx.x;          <span class="cm">// 每个 block 负责一个头</span>
+  <span class="ty">float</span>* q = sq + h*head_size;
+  <span class="cm">// 1) 每线程算若干历史位置的 q·k 分数</span>
+  <span class="kw">for</span>(<span class="ty">int</span> t=threadIdx.x; t&lt;=pos; t+=blockDim.x){
+    <span class="ty">float</span>* k = key_cache + loff + t*kv_dim + (h/kv_mul)*head_size;
+    <span class="ty">float</span> score=<span class="num">0</span>; <span class="kw">for</span>(i...) score += q[i]*k[i];
+    att[t] = score/<span class="fn">sqrtf</span>(head_size);
+  }
+  __syncthreads();
+  <span class="fn">softmax_gpu</span>(att, pos+<span class="num">1</span>);   <span class="cm">// 2) 块内 softmax</span>
+  __syncthreads();
+  <span class="cm">// 3) 每线程算输出的若干维 = Σ att[t]·v[t]</span>
+  <span class="kw">for</span>(<span class="ty">int</span> i=threadIdx.x; i&lt;head_size; i+=blockDim.x){
+    <span class="ty">float</span> val=<span class="num">0</span>;
+    <span class="kw">for</span>(t=<span class="num">0</span>;t&lt;=pos;t++) val += att[t]*v_cache[...][i];
+    xb[i]=val;
+  }
+}
+<span class="fn">..._kernel</span> <span class="ker">&lt;&lt;&lt;n_heads, 1024&gt;&gt;&gt;</span> (...);`,
+   disp:[['grid','n_heads = 6 blocks'],['block','1024 threads'],['读取','KV Cache(历史 K/V)'],['含归约','块内 softmax']],
+   viz:{n:6,cls:'',label:'6 个头 → 6 个 block,每块 1024 线程'}},
+
+  {idx:'⑤', kind:'cublas', tag:'cuBLAS · Sgemv', title:'注意力输出投影 Wo', sub:'拼接的多头输出 → dim 维',
+   concept:'把多头注意力的输出再过一个线性层 Wo,映射回 dim 维。又是矩阵乘,cuBLAS。',
+   formula:'attn_out = Wo · concat(heads)',
+   code:`<span class="fn">matmul</span>(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);`,
+   disp:[['实现','cuBLAS cublasSgemv'],['形状','dim → dim']],
+   viz:{n:6,cls:'lib',label:'cuBLAS'}},
+
+  {idx:'⑥', kind:'kernel', tag:'kernel · accum', title:'残差连接 ①', sub:'x = x + attn_out',
+   concept:'把注意力的结果加回输入(残差/skip connection)。让梯度/信息能跨层直通,是 Transformer 能训深的关键。逐元素加法。',
+   formula:'x ← x + attn_out',
+   code:`<span class="kw">__global__</span> <span class="kw">void</span> <span class="fn">accum_kernel</span>(<span class="ty">float</span>*a,<span class="ty">float</span>*b,<span class="ty">int</span> n){
+  <span class="ty">int</span> i = blockIdx.x*blockDim.x + threadIdx.x;
+  <span class="kw">if</span>(i&lt;n) a[i] += b[i];   <span class="cm">// 一个线程一个元素</span>
+}
+<span class="fn">accum_kernel</span> <span class="ker">&lt;&lt;&lt;divUp(dim,256), 256&gt;&gt;&gt;</span> (x, s->xb2, dim);`,
+   disp:[['grid','⌈288/256⌉ = 2 blocks'],['block','256 threads'],['模式','纯逐元素,无通信']],
+   viz:{n:2,cls:'med',label:'2 blocks × 256(覆盖 288 个元素)'}},
+
+  {idx:'⑦', kind:'kernel', tag:'kernel · rmsnorm', title:'前馈前 RMSNorm', sub:'再次归一化',
+   concept:'进入前馈网络(FFN)前再做一次 RMSNorm。和步骤①同一个 kernel,只是换了权重。',
+   formula:'x̂ = RMSNorm(x) · rms_ffn_weight',
+   code:`<span class="fn">rmsnorm</span>(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+<span class="cm">// 同 ① 的 rmsnorm_kernel &lt;&lt;&lt;1,1024&gt;&gt;&gt;</span>`,
+   disp:[['grid','1 block'],['block','1024 threads'],['复用','与 ① 同 kernel']],
+   viz:{n:1,cls:'',label:'1 block × 1024'}},
+
+  {idx:'⑧', kind:'cublas', tag:'cuBLAS · Sgemv ×2', title:'FFN 升维 (W1, W3)', sub:'dim=288 → hidden=768,两路',
+   concept:'SwiGLU 前馈有两个并行的升维矩阵:W1(门控路)和 W3(数据路)。都从 288 升到 768。两次矩阵乘。',
+   formula:'h1 = W1·x̂    h3 = W3·x̂   // 各 [768]',
+   code:`<span class="fn">matmul</span>(s->hb,  s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+<span class="fn">matmul</span>(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);`,
+   disp:[['实现','cuBLAS ×2'],['形状','288 → 768(两路)']],
+   viz:{n:6,cls:'lib',label:'cuBLAS ×2'}},
+
+  {idx:'⑨', kind:'kernel', tag:'kernel · SwiGLU', title:'SwiGLU 激活', sub:'silu(h1) · h3',
+   concept:'Llama 的前馈激活:对门控路 h1 做 SiLU(=x·sigmoid(x)),再逐元素乘上数据路 h3。这就是 SwiGLU,比 ReLU 表达力更强。',
+   formula:'h = silu(h1) ⊙ h3,  silu(x)=x·σ(x)',
+   code:`<span class="kw">__global__</span> <span class="kw">void</span> <span class="fn">f_silu_elementwise_mul_w3_kernel</span>(<span class="ty">float</span>*hb,<span class="ty">float</span>*hb2,<span class="ty">int</span> n){
+  <span class="ty">int</span> i = blockIdx.x*blockDim.x + threadIdx.x;
+  <span class="kw">if</span>(i&lt;n){
+    <span class="ty">float</span> val = hb[i];
+    val *= <span class="num">1.0f</span>/(<span class="num">1.0f</span>+<span class="fn">expf</span>(-val));  <span class="cm">// SiLU</span>
+    val *= hb2[i];                  <span class="cm">// × W3 路</span>
+    hb[i] = val;
+  }
+}
+<span class="fn">..._kernel</span> <span class="ker">&lt;&lt;&lt;divUp(hidden,256), 256&gt;&gt;&gt;</span> (s->hb,s->hb2,hidden);`,
+   disp:[['grid','⌈768/256⌉ = 3 blocks'],['block','256 threads'],['模式','逐元素,无通信']],
+   viz:{n:3,cls:'med',label:'3 blocks × 256(覆盖 768)'}},
+
+  {idx:'⑩', kind:'cublas', tag:'cuBLAS · Sgemv', title:'FFN 降维 (W2)', sub:'hidden=768 → dim=288',
+   concept:'前馈最后一个矩阵 W2 把 768 维降回 288 维,回到主干维度。矩阵乘,cuBLAS。',
+   formula:'ffn_out = W2 · h   // [288]',
+   code:`<span class="fn">matmul</span>(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);`,
+   disp:[['实现','cuBLAS cublasSgemv'],['形状','768 → 288']],
+   viz:{n:6,cls:'lib',label:'cuBLAS'}},
+
+  {idx:'⑪', kind:'kernel', tag:'kernel · accum', title:'残差连接 ②', sub:'x = x + ffn_out  →  进入下一层',
+   concept:'把 FFN 的输出加回主干。至此一个解码层结束,x 进入下一层重复 ①~⑪。6 层全部走完后进入收尾。',
+   formula:'x ← x + ffn_out   (循环回 ① ,共 6 层)',
+   code:`<span class="fn">accum</span>(x, s->xb, dim);
+<span class="cm">// for 循环结束 → 下一层;6 层都做完 → 跳出</span>`,
+   disp:[['grid','2 blocks'],['block','256 threads'],['之后','循环 / 收尾']],
+   viz:{n:2,cls:'med',label:'2 blocks × 256'}},
+
+  {idx:'C', kind:'kernel', tag:'kernel · rmsnorm', title:'最终 RMSNorm', sub:'6 层之后的收尾归一化',
+   concept:'所有解码层走完,对最终的隐藏状态再做一次 RMSNorm,准备投影到词表。',
+   formula:'x = RMSNorm(x) · rms_final_weight',
+   code:`<span class="fn">rmsnorm</span>(x, x, w->rms_final_weight, dim);`,
+   disp:[['grid','1 block'],['block','1024 threads']],
+   viz:{n:1,cls:'',label:'1 block × 1024'}},
+
+  {idx:'D', kind:'cublas', tag:'cuBLAS · Sgemv', title:'分类头 Classifier', sub:'dim=288 → vocab=32000 个 logit',
+   concept:'最后一个大矩阵(lm_head/wcls)把 288 维投影到 32000 维——词表里每个词一个分数(logit)。这是最大的一次矩阵乘。算完把 logits 拷回主机。',
+   formula:'logits = Wcls · x   // shape: [32000]',
+   code:`<span class="fn">matmul</span>(s->logits_gpu, x, w->wcls, dim, vocab_size);
+<span class="fn">cudaMemcpy</span>(s->logits, s->logits_gpu,
+           vocab_size*<span class="kw">sizeof</span>(<span class="ty">float</span>), cudaMemcpyDeviceToHost);`,
+   disp:[['实现','cuBLAS(最大一次乘)'],['形状','288 → 32000'],['之后','logits 拷回 CPU']],
+   viz:{n:6,cls:'lib',label:'cuBLAS · 288→32000'}},
+
+  {idx:'E', kind:'cpu', tag:'CPU · sample()', title:'采样 Sample', sub:'32000 logit → 1 个 token',
+   concept:'在 CPU 上从 logits 选出下一个 token:温度=0 取最大(贪婪);否则除以温度→softmax→按概率抽样,可选 top-p 截断。采到的 token 喂回开头,循环继续。',
+   formula:'next = argmax | multinomial | top-p',
+   code:`<span class="kw">int</span> <span class="fn">sample</span>(Sampler* s, <span class="ty">float</span>* logits){
+  <span class="kw">if</span>(s->temperature==<span class="num">0</span>) <span class="kw">return</span> <span class="fn">sample_argmax</span>(logits,vocab);  <span class="cm">// 贪婪</span>
+  <span class="kw">for</span>(q...) logits[q] /= s->temperature;   <span class="cm">// 温度缩放</span>
+  <span class="fn">softmax</span>(logits, vocab);                   <span class="cm">// → 概率</span>
+  <span class="kw">float</span> coin = <span class="fn">random_f32</span>(&s->rng_state);
+  <span class="kw">return</span> s->topp&gt;<span class="num">0</span> ? <span class="fn">sample_topp</span>(...) : <span class="fn">sample_mult</span>(...);
+}`,
+   disp:[['执行位置','主机 CPU'],['策略','argmax / multinomial / top-p'],['循环','next → token,回到开头']], viz:null},
+];
+
+/* ============ 渲染流水线卡片 ============ */
+const tagText = {cpu:'CPU', cublas:'cuBLAS', kernel:'CUDA kernel', kv:'kernel + KV$'};
+const listEl = document.getElementById('pipeline-list');
+STAGES.forEach((st,i)=>{
+  const card = document.createElement('div');
+  card.className = 'card';
+  let vizHtml = '';
+  if(st.viz){
+    const blocks = Array.from({length:Math.min(st.viz.n,32)}).map(()=>`<div class="blk ${st.viz.cls}"></div>`).join('');
+    vizHtml = `<div class="gridviz">${blocks}<small>${st.viz.label}</small></div>`;
+  }
+  const dispRows = st.disp.map(d=>`<div class="row"><span class="l">${d[0]}</span><span class="v">${d[1]}</span></div>`).join('');
+  card.innerHTML = `
+    <div class="card-head">
+      <div class="idx">${st.idx}</div>
+      <div class="card-title"><div class="t">${st.title}</div><div class="s">${st.sub}</div></div>
+      <span class="tag ${st.kind}">${st.tag}</span>
+      <svg class="chev" width="16" height="16" viewBox="0 0 16 16"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+    <div class="card-body"><div class="body-in">
+      <div class="col">
+        <h4><span class="dot" style="background:var(--accent)"></span> Transformer 概念</h4>
+        <p>${st.concept}</p>
+        <div class="formula">${st.formula}</div>
+        <h4 style="margin-top:14px"><span class="dot" style="background:var(--kernel)"></span> GPU 调度</h4>
+        <div class="dispatch">${dispRows}</div>
+        ${vizHtml}
+      </div>
+      <div class="col">
+        <h4><span class="dot" style="background:var(--cublas)"></span> run.cu 真实代码</h4>
+        <div class="codecap">~/llama2.cu/run.cu</div>
+        <pre><code>${st.code}</code></pre>
+      </div>
+    </div></div>`;
+  card.querySelector('.card-head').addEventListener('click',()=>card.classList.toggle('open'));
+  listEl.appendChild(card);
+});
+
+/* ============ 解码层 stepper ============ */
+const STEPS = [
+  {n:'初始', shape:'x : [288]', desc:'输入隐藏状态(上一层或词嵌入)', op:'—', color:'var(--text)'},
+  {n:'① RMSNorm', shape:'xb : [288]', desc:'归一化,准备进注意力', op:'rmsnorm_kernel <<<1,1024>>>', color:'var(--kernel)'},
+  {n:'② QKV 投影', shape:'q,k,v : [288]', desc:'投影出 Q/K/V,K/V 写入 KV Cache', op:'cublasSgemv ×3', color:'var(--cublas)'},
+  {n:'③ RoPE', shape:'q,k 旋转', desc:'按位置 pos 旋转 q、k', op:'RoPe_rotation_kernel <<<1,144>>>', color:'var(--kernel)'},
+  {n:'④ Attention', shape:'xb : [288]', desc:'6 头:q·Kᵀ→softmax→·V', op:'multi_head_attention_kernel <<<6,1024>>>', color:'var(--kv)'},
+  {n:'⑤ Wo 投影', shape:'xb2 : [288]', desc:'注意力输出再投影', op:'cublasSgemv', color:'var(--cublas)'},
+  {n:'⑥ 残差', shape:'x : [288]', desc:'x += attn_out', op:'accum_kernel <<<2,256>>>', color:'var(--kernel)'},
+  {n:'⑦ RMSNorm', shape:'xb : [288]', desc:'归一化,准备进 FFN', op:'rmsnorm_kernel <<<1,1024>>>', color:'var(--kernel)'},
+  {n:'⑧ FFN 升维', shape:'hb,hb2 : [768]', desc:'W1、W3 升到 hidden', op:'cublasSgemv ×2', color:'var(--cublas)'},
+  {n:'⑨ SwiGLU', shape:'hb : [768]', desc:'silu(hb)·hb2', op:'f_silu..._kernel <<<3,256>>>', color:'var(--kernel)'},
+  {n:'⑩ FFN 降维', shape:'xb : [288]', desc:'W2 降回 dim', op:'cublasSgemv', color:'var(--cublas)'},
+  {n:'⑪ 残差', shape:'x : [288] →下一层', desc:'x += ffn_out,循环回 ①', op:'accum_kernel <<<2,256>>>', color:'var(--kernel)'},
+];
+let cur = 0;
+const barEl = document.getElementById('layerbar');
+const labelEl = document.getElementById('layerLabel');
+const bodyEl = document.getElementById('stepBody');
+STEPS.forEach((_,i)=>{ if(i>0){const c=document.createElement('div');c.className='lcell';barEl.appendChild(c);} });
+function renderStep(){
+  const s = STEPS[cur];
+  [...barEl.children].forEach((c,i)=>c.classList.toggle('on', i < cur));
+  labelEl.textContent = `步骤 ${cur} / 11`;
+  bodyEl.innerHTML = `
+    <div class="col">
+      <h4><span class="dot" style="background:${s.color}"></span> 当前操作</h4>
+      <p style="font-size:17px;color:#fff;font-weight:700">${s.n}</p>
+      <p style="margin-top:6px">${s.desc}</p>
+      <div class="formula" style="color:${s.color};border-color:${s.color}33">${s.op}</div>
+    </div>
+    <div class="col">
+      <h4><span class="dot" style="background:var(--accent)"></span> 张量形状</h4>
+      <div class="formula" style="font-size:17px">${s.shape}</div>
+      <p style="margin-top:8px">主干维度始终是 <b>288</b>;只有 FFN 内部临时升到 <b>768</b> 再降回。整个过程数据<b>不离开显存</b>。</p>
+    </div>`;
+}
+document.getElementById('nextStep').onclick=()=>{cur=Math.min(cur+1,STEPS.length-1);renderStep();};
+document.getElementById('prevStep').onclick=()=>{cur=Math.max(cur-1,0);renderStep();};
+renderStep();
+
+/* ============ 滚动揭示 ============ */
+const io = new IntersectionObserver((es)=>es.forEach(e=>{if(e.isIntersecting)e.target.classList.add('in');}),{threshold:.08});
+document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+
+/* 默认展开第一个解码层操作,引导用户 */
+listEl.children[2]?.classList.add('open');
+</script>
+</body>
+</html>

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mermaid 渲染 · Transformer 推理流程</title>
+<style>
+  body{margin:0;background:#0b1020;color:#dce6f5;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+  header{padding:18px 24px;border-bottom:1px solid #1e2d49}
+  header h1{margin:0;font-size:17px}
+  header p{margin:4px 0 0;color:#8497b8;font-size:13px}
+  .toolbar{padding:10px 24px;display:flex;gap:10px}
+  button{background:#13213a;color:#dce6f5;border:1px solid #1e2d49;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px}
+  button:hover{border-color:#38bdf8}
+  .stage{padding:24px;overflow:auto}
+  .mermaid{background:#0f1a2e;border:1px solid #1e2d49;border-radius:12px;padding:24px;display:inline-block;min-width:100%}
+</style></head>
+<body>
+<header><h1>Transformer 推理流程 · Mermaid 渲染</h1>
+<p>来源:~/llama2.cu/docs/transformer-inference.md · 渲染库走 CDN(需联网首次加载)</p></header>
+<div class="toolbar"><button onclick="exportSVG()">下载 SVG</button></div>
+<div class="stage"><pre class="mermaid">flowchart TD
+    A["🟠 分词 encode()<br/>字符串 → token id"] --> B["🟠 词嵌入<br/>cudaMemcpy 一行向量上显存<br/>x:[288]"]
+    B --> L{{"6 层解码层循环<br/>for l in 0..n_layers"}}
+
+    subgraph DECODER["一个解码层(重复 6 次)"]
+        direction TB
+        S1["🟢 ① RMSNorm (attn)<br/>rmsnorm_kernel &lt;&lt;&lt;1,1024&gt;&gt;&gt;"]
+        S2["🟣 ② QKV 投影<br/>cublasSgemv ×3<br/>🌸 K/V 写入 KV Cache"]
+        S3["🟢 ③ RoPE<br/>&lt;&lt;&lt;1,144&gt;&gt;&gt;"]
+        S4["🌸 ④ 多头注意力<br/>&lt;&lt;&lt;6,1024&gt;&gt;&gt;<br/>读 KV Cache"]
+        S5["🟣 ⑤ Wo 投影<br/>cublasSgemv"]
+        S6["🟢 ⑥ 残差 x+=attn<br/>accum &lt;&lt;&lt;2,256&gt;&gt;&gt;"]
+        S7["🟢 ⑦ RMSNorm (ffn)<br/>&lt;&lt;&lt;1,1024&gt;&gt;&gt;"]
+        S8["🟣 ⑧ FFN 升维 W1,W3<br/>cublasSgemv ×2<br/>288→768"]
+        S9["🟢 ⑨ SwiGLU<br/>&lt;&lt;&lt;3,256&gt;&gt;&gt;"]
+        S10["🟣 ⑩ FFN 降维 W2<br/>cublasSgemv 768→288"]
+        S11["🟢 ⑪ 残差 x+=ffn<br/>accum &lt;&lt;&lt;2,256&gt;&gt;&gt;"]
+        S1-->S2-->S3-->S4-->S5-->S6-->S7-->S8-->S9-->S10-->S11
+    end
+
+    L --> S1
+    S11 -->|"还有层"| L
+    S11 -->|"6 层走完"| C["🟢 最终 RMSNorm<br/>&lt;&lt;&lt;1,1024&gt;&gt;&gt;"]
+    C --> D["🟣 分类头 Wcls<br/>cublasSgemv 288→32000<br/>logits 拷回 CPU"]
+    D --> E["🟠 采样 sample()<br/>argmax / top-p / 温度"]
+    E -->|"next token 喂回"| B</pre></div>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({startOnLoad:true, theme:"dark", securityLevel:"loose"});
+  window.exportSVG = ()=>{
+    const svg = document.querySelector(".mermaid svg");
+    if(!svg){alert("图还没渲染好");return;}
+    const blob = new Blob([svg.outerHTML], {type:"image/svg+xml"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = "transformer-flow.svg"; a.click();
+  };
+</script>
+</body></html>
