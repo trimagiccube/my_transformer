@@ -861,10 +861,23 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     return res != NULL ? res->id : -1;
 }
 
+// [观测] 把当前 token 序列以可读片段形式打印出来,空格显示为 '_' 方便看
+static void trace_bpe_seq(Tokenizer* t, int* tokens, int n) {
+    fprintf(stderr, "        ");
+    for (int i = 0; i < n; i++) {
+        const char* s = t->vocab[tokens[i]];
+        fprintf(stderr, "[");
+        for (const char* p = s; *p; p++) fputc(*p == ' ' ? '_' : *p, stderr);
+        fprintf(stderr, "]");
+    }
+    fprintf(stderr, "   (%d tokens)\n", n);
+}
+
 void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
     // encode the string text (input) into an upper-bound preallocated tokens[] array
     // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
     if (text == NULL) { fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE); }
+    int trace = (getenv("TRACE_BPE") != NULL); // [观测] 设了环境变量才打印 BPE 过程
 
     if (t->sorted_vocab == NULL) {
         // lazily malloc and sort the vocabulary
@@ -945,6 +958,15 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         str_len = 0; // protect against a sequence of stray UTF8 continuation bytes
     }
 
+    // [观测] 打印 BPE 合并前的初始拆分
+    if (trace) {
+        fprintf(stderr, "\n========== [encode] BPE 合并过程: \"%s\" ==========\n", text);
+        fprintf(stderr, "  初始拆分(每个字符/字节一个 token):\n");
+        trace_bpe_seq(t, tokens, *n_tokens);
+        fprintf(stderr, "  开始合并(每轮选 score 最高的相邻对):\n");
+    }
+    int merge_step = 0;
+
     // merge the best consecutive pair each iteration, according the scores in vocab_scores
     while (1) {
         float best_score = -1e10;
@@ -967,6 +989,19 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
             break; // we couldn't find any more pairs to merge, so we're done
         }
 
+        // [观测] 打印这一步合并了哪一对、合成什么、score 多少
+        if (trace) {
+            char a[256], b[256];
+            snprintf(a, sizeof(a), "%s", t->vocab[tokens[best_idx]]);
+            snprintf(b, sizeof(b), "%s", t->vocab[tokens[best_idx+1]]);
+            for (char* p=a; *p; p++) if (*p==' ') *p='_';
+            for (char* p=b; *p; p++) if (*p==' ') *p='_';
+            char merged[512]; snprintf(merged, sizeof(merged), "%s", t->vocab[best_id]);
+            for (char* p=merged; *p; p++) if (*p==' ') *p='_';
+            fprintf(stderr, "  第%2d步: 合并 [%s]+[%s] -> [%s]  (id=%d, score=%.4f, 位置%d)\n",
+                    ++merge_step, a, b, merged, best_id, best_score, best_idx);
+        }
+
         // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
         tokens[best_idx] = best_id;
         // delete token at position best_idx+1, shift the entire sequence back 1
@@ -974,6 +1009,13 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
             tokens[i] = tokens[i+1];
         }
         (*n_tokens)--; // token length decreased
+        if (trace) trace_bpe_seq(t, tokens, *n_tokens);
+    }
+
+    if (trace) {
+        fprintf(stderr, "  最终 %d 个 token,id 序列: [", *n_tokens);
+        for (int i = 0; i < *n_tokens; i++) fprintf(stderr, "%s%d", i?", ":"", tokens[i]);
+        fprintf(stderr, "]\n========================================================\n\n");
     }
 
     // add optional EOS (=2) token, if desired
