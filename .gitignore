@@ -11,3 +11,4 @@ runcuda
 *.lib
 *.bin
 tags
+cscope.*

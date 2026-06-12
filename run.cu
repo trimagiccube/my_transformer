@@ -57,14 +57,18 @@ void destroy_cublas_handle() {
 // ----------------------------------------------------------------------------
 // Transformer model
 
+// ============================================================================
+// Config: 模型超参数,即 .bin 文件最开头的 7 个 int(共 28 字节)的"蓝图"。
+// 注释中的示例数值来自 stories15M.bin。
+// ============================================================================
 typedef struct {
-    int dim; // transformer dimension
-    int hidden_dim; // for ffn layers
-    int n_layers; // number of layers
-    int n_heads; // number of query heads
-    int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
-    int vocab_size; // vocabulary size, usually 256 (byte-level)
-    int seq_len; // max sequence length
+    int dim;         // 主干隐藏维度 (hidden size)。x 向量的长度。  例: 288
+    int hidden_dim;  // FFN 中间层维度 (升维后的宽度)。           例: 768
+    int n_layers;    // 解码层数量 (decoder layer 个数)。          例: 6
+    int n_heads;     // Query 注意力头数。 head_size = dim/n_heads. 例: 6 (→head_size=48)
+    int n_kv_heads;  // Key/Value 头数。 < n_heads 即 GQA/MQA 共享. 例: 6 (=n_heads,即普通MHA)
+    int vocab_size;  // 词表大小。 文件里若为负=不共享 lm_head 权重. 例: 32000
+    int seq_len;     // 最大序列长度 (KV cache / 位置上限)。        例: 256
 } Config;
 
 // CUDA NOTE: The TransformerWeights structure will be stored on the host, 
@@ -203,35 +207,81 @@ void free_run_state(RunState* s) {
 }
 #endif
 
+// memory_map_weights: 权重区在文件里是一段连续的 float 流(无名字、无分隔)。
+// 这里按"固定顺序"把一根大指针 ptr 切成各个权重矩阵——每赋一个指针,就把 ptr
+// 往后推进该矩阵的元素个数。顺序必须和 export.py 写出来的顺序完全一致。
 void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
     int head_size = p->dim / p->n_heads;
     // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
     unsigned long long n_layers = p->n_layers;
-    w->token_embedding_table = ptr;
+    float* base = ptr; // [观测] 记下权重区起点,用于计算每个矩阵的偏移
+
+    w->token_embedding_table = ptr;                              // (vocab, dim)  词嵌入表
     ptr += p->vocab_size * p->dim;
-    w->rms_att_weight = ptr;
+    w->rms_att_weight = ptr;                                     // (layer, dim)  注意力前 RMSNorm 增益
     ptr += n_layers * p->dim;
-    w->wq = ptr;
+    w->wq = ptr;                                                 // (layer, dim, n_heads*head_size)  Q 投影
     ptr += n_layers * p->dim * (p->n_heads * head_size);
-    w->wk = ptr;
+    w->wk = ptr;                                                 // (layer, dim, n_kv_heads*head_size) K 投影
     ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wv = ptr;
+    w->wv = ptr;                                                 // (layer, dim, n_kv_heads*head_size) V 投影
     ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wo = ptr;
+    w->wo = ptr;                                                 // (layer, dim, dim)  注意力输出投影
     ptr += n_layers * (p->n_heads * head_size) * p->dim;
-    w->rms_ffn_weight = ptr;
+    w->rms_ffn_weight = ptr;                                     // (layer, dim)  FFN 前 RMSNorm 增益
     ptr += n_layers * p->dim;
-    w->w1 = ptr;
+    w->w1 = ptr;                                                 // (layer, hidden, dim)  FFN 门控升维
     ptr += n_layers * p->dim * p->hidden_dim;
-    w->w2 = ptr;
+    w->w2 = ptr;                                                 // (layer, dim, hidden)  FFN 降维
     ptr += n_layers * p->hidden_dim * p->dim;
-    w->w3 = ptr;
+    w->w3 = ptr;                                                 // (layer, hidden, dim)  FFN 数据升维
     ptr += n_layers * p->dim * p->hidden_dim;
-    w->rms_final_weight = ptr;
+    w->rms_final_weight = ptr;                                   // (dim,)  最终 RMSNorm 增益
     ptr += p->dim;
-    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
-    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
+    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE) —— 老格式遗留,跳过
+    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE) —— RoPE 现在运行时算
+    // 分类头:若共享则直接复用词嵌入表(省一份大矩阵),否则用紧跟其后的权重
     w->wcls = shared_weights ? w->token_embedding_table : ptr;
+
+    // ---- [观测] 打印每个权重矩阵的形状 / 元素数 / 在权重区内的偏移 ----------
+    unsigned long long L = n_layers, D = p->dim, H = p->hidden_dim;
+    unsigned long long Qd = p->n_heads * head_size, KVd = p->n_kv_heads * head_size;
+    fprintf(stderr, "\n========================= [memory_map_weights] 权重布局 =========================\n");
+    fprintf(stderr, "  分层列: 'L×单层' 表示该块内按 %llu 层首尾相接,每层独立权重(w->X + l*单层)\n", L);
+    fprintf(stderr, "  %-18s %-22s %13s  %4s  %11s  %11s\n",
+            "名称", "形状", "总元素", "分层", "单层元素", "偏移(elem)");
+    fprintf(stderr, "  ------------------------------------------------------------------------------\n");
+    // layered=1 的块:总元素 = L × per_layer,块内按 6 层细分;layered=0:整块,全模型 1 份
+    #define WLOG(field, shapestr, layered, per_layer) do { \
+        unsigned long long _pl = (unsigned long long)(per_layer); \
+        unsigned long long _tot = (layered) ? (L * _pl) : _pl; \
+        if (layered) \
+            fprintf(stderr, "  %-18s %-22s %13llu  %4s  %11llu  %11lld\n", #field, shapestr, \
+                    _tot, "L×", _pl, (long long)(w->field - base)); \
+        else \
+            fprintf(stderr, "  %-18s %-22s %13llu  %4s  %11s  %11lld\n", #field, shapestr, \
+                    _tot, "—", "(整块)", (long long)(w->field - base)); \
+    } while(0)
+    WLOG(token_embedding_table, "(vocab, dim)",        0, (unsigned long long)p->vocab_size * D);
+    WLOG(rms_att_weight,        "(layer, dim)",         1, D);
+    WLOG(wq,                    "(layer, dim, Qd)",     1, D * Qd);
+    WLOG(wk,                    "(layer, dim, KVd)",    1, D * KVd);
+    WLOG(wv,                    "(layer, dim, KVd)",    1, D * KVd);
+    WLOG(wo,                    "(layer, Qd, dim)",     1, Qd * D);
+    WLOG(rms_ffn_weight,        "(layer, dim)",         1, D);
+    WLOG(w1,                    "(layer, hidden, dim)", 1, D * H);
+    WLOG(w2,                    "(layer, dim, hidden)", 1, H * D);
+    WLOG(w3,                    "(layer, hidden, dim)", 1, D * H);
+    WLOG(rms_final_weight,      "(dim,)",               0, D);
+    WLOG(wcls,                  "(vocab, dim)",         0, (unsigned long long)p->vocab_size * D);
+    #undef WLOG
+    fprintf(stderr, "  ------------------------------------------------------------------------------\n");
+    fprintf(stderr, "  注: Qd=n_heads*head_size=%llu, KVd=n_kv_heads*head_size=%llu\n", Qd, KVd);
+    fprintf(stderr, "      分层块 'L×' 内含 %llu 个独立子矩阵(各层 W_Q/W_K/W_V/... 互不共享)%s\n",
+            L, shared_weights ? "" : "");
+    if (shared_weights)
+        fprintf(stderr, "      wcls 与 token_embedding 共享(偏移相同 0,文件不单独存储)\n");
+    fprintf(stderr, "================================================================================\n\n");
 }
 
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
@@ -239,14 +289,31 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     FILE *file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
     // read in the config header
+    // .bin 开头就是一个 Config 结构(7 个 int)。fread 一次性把"蓝图"读进来。
     if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
     // negative vocab size is hacky way of signaling unshared weights. bit yikes.
+    // vocab_size 为负 = lm_head(分类头)不与 token embedding 共享权重(这是个 hack 约定)。
     int shared_weights = config->vocab_size > 0 ? 1 : 0;
     config->vocab_size = abs(config->vocab_size);
     // figure out the file size
     fseek(file, 0, SEEK_END); // move file pointer to end of file
     *file_size = ftell(file); // get the file size, in bytes
     fclose(file);
+
+    // ---- [观测] 打印解析出来的 Config 超参 ----------------------------------
+    int head_size_dbg = config->dim / config->n_heads;
+    fprintf(stderr, "\n==================== [read_checkpoint] Config ====================\n");
+    fprintf(stderr, "  dim            = %d   (主干隐藏维度)\n", config->dim);
+    fprintf(stderr, "  hidden_dim     = %d   (FFN 中间层维度)\n", config->hidden_dim);
+    fprintf(stderr, "  n_layers       = %d   (解码层数)\n", config->n_layers);
+    fprintf(stderr, "  n_heads        = %d   (Query 头数)\n", config->n_heads);
+    fprintf(stderr, "  n_kv_heads     = %d   (KV 头数, < n_heads 即 GQA)\n", config->n_kv_heads);
+    fprintf(stderr, "  head_size      = %d   (= dim / n_heads)\n", head_size_dbg);
+    fprintf(stderr, "  vocab_size     = %d\n", config->vocab_size);
+    fprintf(stderr, "  seq_len        = %d   (最大序列长度)\n", config->seq_len);
+    fprintf(stderr, "  shared_weights = %d   (lm_head 是否复用 embedding)\n", shared_weights);
+    fprintf(stderr, "  file_size      = %.2f MB\n", (double)(*file_size) / (1024.0 * 1024.0));
+    fprintf(stderr, "==================================================================\n");
     // memory map the Transformer weights into the data pointer
     *fd = open(checkpoint, O_RDONLY); // open in read only mode
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
