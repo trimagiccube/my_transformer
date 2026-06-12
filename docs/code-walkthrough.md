@@ -15,8 +15,8 @@
 5. [模型文件 .bin 布局](#5-模型文件-bin-布局)
 6. [关键维度概念](#6-关键维度概念-dim--hidden_dim--head_size--seq_len)
 7. [hidden_states / 隐藏状态](#7-hidden_states--隐藏状态)
-8. [Tokenizer 分词器](#8-tokenizer-分词器)
-9. [prefill 阶段](#9-prefill-阶段)
+8. [Tokenizer 分词器](#8-tokenizer-分词器)(含 score 含义 & BPE 合并追踪)
+9. [运行时主流程:generate / forward / sample](#9-运行时主流程generate--forward--sample)(含 prefill/decode、lm_head、Sampler)
 10. [观测日志](#10-观测日志read_checkpoint--memory_map_weights)
 
 ---
@@ -398,35 +398,142 @@ void build_tokenizer(Tokenizer* t, char* path, int vocab_size) {
 
 设计细节:`sorted_vocab` 懒加载(decode 用不上,省启动开销);`byte_pieces` 提前填好做 UTF-8 兜底;每个 vocab[i] 按 len 单独 malloc(token 变长)。
 
----
+### token 的 score 是什么 & BPE 合并过程
 
-## 9. prefill 阶段
+`vocab_scores[id]` 是每个 token 的**合并优先级**,本质是 SentencePiece 训练时学到的**(对数)概率分数**:负数,越接近 0 = 越高频/越优先。
 
-**有 prefill 的"逻辑",但没有 prefill 的"优化"。**
-
-`generate()` 里 prefill 和 decode 共用同一个循环、同一个 `forward()`,区别只在「下一个 token 从哪来」:
+`encode` 的 BPE 是**贪心合并**:先把字符串拆成单字符,然后每一轮**扫描所有相邻对**,查出每对合并后那个 token 的预存 score,**选 score 最高的合并一次**,直到无对可合。
 
 ```c
-while (pos < steps) {
-    forward(transformer, token, pos);          // 永远只喂 1 个 token
-    if (pos < num_prompt_tokens - 1)
-        next = prompt_tokens[pos + 1];          // 还在prompt:强行喂下一个prompt token(不采样)
-    else
-        next = sample(sampler, logits);         // prompt跑完:才真正采样
-    pos++;
+while (1) {
+    float best_score = -1e10; int best_idx = -1;
+    for (每对相邻 token i,i+1) {
+        id = 查词表(vocab[i] + vocab[i+1]);        // 这对能合成已知 token 吗
+        if (id != -1 && vocab_scores[id] > best_score) {  // 比 score,谁高选谁
+            best_score = vocab_scores[id]; best_idx = i;
+        }
+    }
+    if (best_idx == -1) break;                     // 没有可合并的 → 结束
+    合并 best_idx 这一对;                           // 一轮只合一对
 }
 ```
 
-所以"prefill"= 前 num_prompt_tokens 步丢弃输出、强喂 prompt token,只为把 K/V 填进 KV Cache。
+> 关键:`score` 是"合并结果 token 在词表里的固定分数",**查表得到、非临时计算**。贪心比的就是这些固定值。
+
+**实跑追踪**(本仓库给 `encode` 加了 `TRACE_BPE` 开关):
+```bash
+bash scripts/run.sh -T -i "Once upon a time"   # -T 开启 BPE 过程打印
+```
+真实输出(stories15M 词表):
+```
+初始: [_][O][n][c][e][_][u][p][o][n][_][a][_][t][i][m][e]   (18 tokens)
+第1步: [_]+[t]  -> [_t]     score=-1       ← 分数最高,先合
+第3步: [o]+[n]  -> [on]     score=-6
+...
+第12步:[_up]+[on] -> [_upon] score=-2242
+第13步:[_On]+[ce] -> [_Once] score=-8779   ← 分数最低,最后合
+最终: [_Once][_upon][_a][_time]  →  id: [1, 9038, 2501, 263, 931]
+```
+现象:score 列单调递减(每轮选当前最高),**高频小片段(`_t`/`on`)先合,罕见完整词(`_Once`)最后才拼出**。BPE 合并**只对 prompt 做一次**;生成阶段输出的本就是 token id,无需再 encode。
+
+---
+
+## 9. 运行时主流程:generate / forward / sample
+
+真正的"运行"从 `generate()` 开始(三个 build 都只是装载)。本节讲生成主循环,以及它每步调用的 `forward` 和 `sample`。
+
+### 9.1 generate() 主干流程
+
+```
+generate(transformer, tokenizer, sampler, prompt, steps)
+├─ 1. 分词    encode(prompt) → prompt_tokens[], num_prompt_tokens
+├─ 2. 初始化  token = prompt_tokens[0];  pos = 0
+├─ 3. 主循环 while (pos < steps):
+│      a. forward(token, pos) → logits        ← 算一次完整前向
+│      b. 下一个 token:
+│           还在 prompt 内 → 用 prompt_tokens[pos+1]   (不采样)
+│           已过 prompt    → sample(logits)            (采样)
+│      c. pos++
+│      d. next==1 (BOS) → break               ← 序列结束
+│      e. decode(token→文字) 并打印            ← 流式输出
+│      f. token = next                         ← 喂回,自回归
+└─ 4. 收尾   打印 tok/s,free
+```
+
+```c
+void generate(...) {
+    encode(tok, prompt, 1/*BOS*/, 0, prompt_tokens, &num_prompt_tokens);  // 分词
+    int token = prompt_tokens[0], pos = 0, next;
+    while (pos < steps) {
+        float* logits = forward(t, token, pos);          // a
+        if (pos < num_prompt_tokens - 1) next = prompt_tokens[pos + 1];  // b: prompt阶段,不采样
+        else                             next = sample(s, logits);       //    生成阶段,采样
+        pos++;                                            // c
+        if (next == 1) break;                             // d: BOS=结束符
+        safe_printf(decode(tok, token, next));            // e: 流式打印
+        token = next;                                     // f: 自回归喂回
+    }
+    // 4. tok/s 统计(计时从第2步起,排除较慢的首步)
+}
+```
+
+三个要点:**① 自回归**——`token=next` 把这步的输出喂作下步输入,一个接一个滚。**② 流式输出**——每个 token 立即 decode+打印+fflush,所以文字一个个蹦出来。**③ 何时停**——`pos>=steps`(到 -n 上限)或 `next==1`(采到 BOS)。
+
+### 9.2 forward 是什么(不是某个"阶段")
+
+`forward` 是**神经网络的一次完整前向传播**:把 1 个 token 从头算到尾,吐出 32000 个 logits。它**包含**了所有计算步骤(嵌入→6层解码→最终norm→lm_head),细节见 `transformer-inference.md`。
+
+- forward 是"动词"(算一次);**prefill / decode 只是调用它的两种场景**,用的是同一个 forward。
+- `forward(t, token, pos)` 签名只接收**单个 token** → 这个 demo 逐 token 串行,无批处理能力。
+
+### 9.3 prefill vs decode:共用一个循环
+
+**有 prefill 的"逻辑",没有 prefill 的"优化"。** 二者共用 9.1 的循环,区别只在「下一个 token 从哪来」:
+
+| | prompt 阶段(prefill) | 生成阶段(decode) |
+|--|----------------------|------------------|
+| pos 范围 | `< num_prompt_tokens-1` | 之后 |
+| forward | ✅ 照算(为填 KV Cache) | ✅ |
+| 下一个 token | 用已知 prompt token | `sample()` 采样 |
+| logits | **算了但丢弃** | 用来采样 |
 
 | | 真正的 prefill(如 ~/infer) | llama2.cu |
 |--|---------------------------|-----------|
 | 处理 prompt | 一次性**并行**整个 prompt | **逐 token 串行** |
-| forward 输入 | `[1, prompt_len]` 一批 | 单个 token |
 | attention kernel | 专门 prefill flash-attn | 与 decode 共用 |
-| prompt 长时 | 收益大 | 线性变慢 |
+| lm_head | prompt 只在最后位置算 | **每步都算(prompt 阶段冗余)** |
 
-`forward(transformer, token, pos)` 签名只接收单个 `int token`,根本没有批处理序列的能力 —— 这是它"教学优先、不要性能"取舍的又一体现。
+### 9.4 lm_head:把隐藏状态变成词表分数
+
+forward 的最后一步,代码里叫 `wcls`,是 `(vocab, dim)=(32000,288)` 的分类矩阵(Language Model Head):
+
+```c
+matmul(s->logits_gpu, x, w->wcls, dim, vocab_size);  // x[288] → logits[32000]
+```
+
+- **为什么算全部 32000 个**:采样要在所有候选词里选,必须给每个词都打分才能形成概率分布——这在"要采样的步"是必需的,不是浪费。
+- **真正的冗余**:prompt 阶段每步也算了 lm_head 却丢掉(下个词已知)。优化引擎会在 prefill 只对最后位置算。
+- **本模型 wcls 与 token_embedding 共享**(weight tying,见第 5 节):输入"词→向量"和输出"向量→词"互逆,复用一套权重省 35MB。
+- lm_head 是单次 forward 里最大的矩阵乘(vocab 32000 ≫ dim 288)。
+
+### 9.5 Sampler:从 logits 选 token 的决策抽象
+
+`Sampler`(run.cu:994)封装"如何从 logits 选下一个词":策略参数(`temperature`/`topp`)+ 随机状态(`rng_state`)+ 工作缓冲(`probindex`)。**每个生成步采样一次,产出 1 个 token**:
+
+```c
+int sample(Sampler* s, float* logits) {
+    if (s->temperature == 0) return sample_argmax(...);   // ① 贪婪:取最高分(确定性)
+    for(...) logits[q] /= s->temperature;                 //    温度缩放
+    softmax(logits, vocab);                               //    → 概率
+    float coin = random_f32(&s->rng_state);               //    掷骰子
+    return s->topp>0 && s->topp<1 ? sample_topp(...)      // ② top-p 核采样
+                                  : sample_mult(...);      // ③ 全分布多项式采样
+}
+```
+
+分工:**Transformer 算分数(logits)→ Sampler 拍板选词 → Tokenizer 译回文字**。
+
+> 数量关系:生成阶段 **每步 = 1 次 forward + 1 次 sample → 1 个 token**;prompt 阶段 forward 照跑但跳过 sample(下个词已知)。
 
 ---
 
