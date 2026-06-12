@@ -1,0 +1,384 @@
+# llama2.cu · 代码导读 & 概念 FAQ
+
+> 配套 `docs/transformer-inference.md`(讲推理流程)。本篇侧重**从入口读代码、核心数据结构、模型文件布局、关键维度概念**,以问答形式整理。
+> 示例数值来自实测 `stories15M.bin`:`dim=288, hidden_dim=768, n_layers=6, n_heads=6, n_kv_heads=6, head_size=48, vocab=32000, seq_len=256`。
+
+---
+
+## 目录
+
+1. [程序入口与阅读顺序](#1-程序入口与阅读顺序)
+2. [命令行参数](#2-命令行参数)
+3. [run.c vs runq.c](#3-runc-vs-runqc)
+4. [核心数据结构](#4-核心数据结构)
+5. [模型文件 .bin 布局](#5-模型文件-bin-布局)
+6. [关键维度概念](#6-关键维度概念-dim--hidden_dim--head_size--seq_len)
+7. [hidden_states / 隐藏状态](#7-hidden_states--隐藏状态)
+8. [Tokenizer 分词器](#8-tokenizer-分词器)
+9. [prefill 阶段](#9-prefill-阶段)
+10. [观测日志](#10-观测日志read_checkpoint--memory_map_weights)
+
+---
+
+## 1. 程序入口与阅读顺序
+
+入口是标准 `main()`(`run.cu:1251`),做 4 件事:
+
+```
+main()
+├─ 1. 解析命令行         (argv[1]=模型路径;-t -p -s -n -i -z -m -y)
+├─ 2. 构建三大对象
+│     ├─ build_transformer()  ← mmap 加载权重 + 读 config
+│     ├─ build_tokenizer()    ← 加载词表
+│     └─ build_sampler()      ← 初始化采样器
+├─ 3. create_cublas_handle()  ← GPU 版初始化 cuBLAS
+└─ 4. generate() 或 chat()    ← 主循环
+```
+
+**建议阅读顺序**:
+
+| 步骤 | 看什么 | 位置 | 重点 |
+|------|--------|------|------|
+| ① | `main()` | 1251 | 建立全局观 |
+| ② | `read_checkpoint` / `memory_map_weights` | 237 / 206 | mmap、读 config、权重切分 |
+| ③ | `generate()` | 主循环 | prefill/decode 共用、KV Cache |
+| ④ | `forward()` | 623 | ⭐核心:一个 token 过 6 层 |
+| ⑤ | 各 kernel | 301–621 | rmsnorm/RoPE/attention/SwiGLU |
+| ⑥ | `sample()` | 1036 | logits → next token |
+| ⑦ | `encode`/`decode` | ~755/~782 | BPE 分词 |
+
+---
+
+## 2. 命令行参数
+
+```
+./runcuda <模型文件> [选项...]
+```
+
+| 参数 | 类型 | 默认 | 含义 |
+|------|------|------|------|
+| `<模型文件>` | 路径 | 必传 | 第一个位置参数,如 `stories15M.bin` |
+| `-t` | float | 1.0 | **温度**:0=贪婪(确定);1.0=原始;越大越随机 |
+| `-p` | float | 0.9 | **top-p** 核采样:只在累积概率前 p 的词里采样;1.0=关闭 |
+| `-s` | int | 时间 | **随机种子**:固定可复现 |
+| `-n` | int | 256 | **生成步数**:0 或超 seq_len 会截到 seq_len |
+| `-i` | string | 无 | **输入 prompt** |
+| `-z` | string | tokenizer.bin | 自定义分词器路径 |
+| `-m` | string | generate | 模式:`generate` / `chat` |
+| `-y` | string | 无 | system prompt(仅 chat) |
+
+**调参直觉**:要稳定→`-t` 调低或 `-t 0`;要创意→`-t` 调高;要复现→固定 `-s`。
+
+---
+
+## 3. run.c vs runq.c
+
+| | `run.c` | `runq.c` |
+|--|---------|----------|
+| 精度 | **fp32** | **int8 量化** |
+| 权重类型 | `float*` | `QuantizedTensor`(`int8_t* q` + `float* s`) |
+| 模型文件 | v0/v1 格式 | version2 量化导出 |
+| 体积 | 基准 | **小 ~4×** |
+| 速度 | 基准 | **快 ~3×** |
+
+**为什么大量代码重复**:量化只影响"权重存储 + matmul"这条线,其余(分词、采样、生成循环、main、非 matmul 算子)完全一样,原作者直接复制一份再改关键路径 —— 教学项目刻意不抽象,宁可重复也要让每个文件单文件自包含、可读。
+
+runq.c 独有:`QuantizedTensor` 结构、`quantize()`/`dequantize()`、int8 matmul(Q8_0 分组对称量化:每 GS 个权重一组,组内按绝对值最大值定 scale,存 int8 + scale)。
+
+> 注意:GPU 版 `run.cu` 基于 fp32 的 run.c,**没有量化的 GPU 版**;runq.c 是纯 CPU int8。
+
+---
+
+## 4. 核心数据结构
+
+`Transformer` 结构体把三者合一(`run.cu:122`):
+
+```c
+typedef struct {
+    Config config;              // 超参(蓝图)
+    TransformerWeights weights; // 权重(只读模型)
+    RunState state;             // 激活值缓冲(可写,流动的数据)
+    int fd; float* data; ssize_t file_size;  // mmap 清理用
+} Transformer;
+```
+
+### Config — 超参(.bin 开头 7 个 int)
+```c
+int dim;         // 主干隐藏维度          288
+int hidden_dim;  // FFN 中间层维度        768
+int n_layers;    // 解码层数              6
+int n_heads;     // Query 头数            6
+int n_kv_heads;  // KV 头数(<n_heads=GQA) 6
+int vocab_size;  // 词表大小(负=不共享lm_head) 32000
+int seq_len;     // 最大序列长度          256
+```
+
+### TransformerWeights — 权重(指针指向显存)
+- `token_embedding_table` (vocab,dim) — 词嵌入表
+- `rms_att_weight` / `rms_ffn_weight` (layer,dim) — 两处 RMSNorm 增益
+- `wq/wk/wv/wo` — 注意力四矩阵(**每层独立**)
+- `w1/w2/w3` — FFN 三矩阵(**每层独立**)
+- `rms_final_weight` (dim,) — 最终 norm
+- `wcls` — 分类头(本模型与 embedding 共享)
+
+### RunState — 激活值缓冲(推理的"草稿纸")
+
+**作用**:存放数据在网络里流动时每一步的中间结果。权重是不变的"模型",RunState 是流动的"数据"。
+
+| 类别 | 字段 | 生命周期 | 作用 |
+|------|------|---------|------|
+| 主干状态 | `x` (dim) | 整个 forward | 贯穿 6 层的隐藏状态 |
+| 临时草稿 | `xb,xb2,q,k,v,hb,hb2,att` | 用完即覆盖 | 算子间传中间结果 |
+| 跨步记忆 | `key_cache,value_cache` | 整个生成过程 | KV Cache,累积历史 K/V |
+| 输出 | `logits/logits_gpu` | 每步末尾 | 词表分数,拷回 CPU 采样 |
+
+**设计要点**:所有 buffer 在 `malloc_run_state()` **启动时一次性 cudaMalloc**,之后每 token / 每层复用同一块显存,不在热路径反复申请。结构体在主机,但每个 `float*` 指向 GPU(`logits` 例外,在 CPU,因为采样在 CPU)。
+
+---
+
+## 5. 模型文件 .bin 布局
+
+`read_checkpoint` 先 `fread` 出 28 字节 Config 头,再 `mmap` 权重区拷到 GPU,最后 `memory_map_weights` 把一根大指针按布局切成各权重矩阵。
+
+```
+ stories15M.bin · 60,816,028 字节 (58.0 MiB) · n_layers=6
+ ┌──────────────────────────────────────────────────────────────┐
+ │ [0..28)  CONFIG 头 (7×int32)                                   │
+ ╞══════════════════════════════════════════════════════════════╡
+ │ 权重区(字节28起,连续 fp32,无名字无分隔)                     │
+ │                                                                │
+ │ token_embedding  [整块·全模型1份]  9,216,000 (35.2MiB)         │
+ │                                                                │
+ │ ╭── 以下每块内部按「6层首尾相接」存,L0→L5 各自独立 ──────╮    │
+ │ │ wq  ┌L0┬L1┬L2┬L3┬L4┬L5┐ 单层288×288=82,944 / 共497,664 │    │
+ │ │     └──┴──┴──┴──┴──┴──┘  ▲ w->wq + l*dim*dim 定位第l层  │    │
+ │ │ wk  ┌L0┬L1┬L2┬L3┬L4┬L5┐ 同上                            │    │
+ │ │ wv  ┌L0┬L1┬L2┬L3┬L4┬L5┐                                 │    │
+ │ │ wo  ┌L0┬L1┬L2┬L3┬L4┬L5┐                                 │    │
+ │ │ w1  ┌L0┬L1┬L2┬L3┬L4┬L5┐ 单层768×288=221,184/共1,327,104 │    │
+ │ │ w2/w3 同 w1                                              │    │
+ │ │ rms_att / rms_ffn ┌L0..L5┐ 单层288                       │    │
+ │ ╰──────────────────────────────────────────────────────────╯ │
+ │                                                                │
+ │ rms_final_weight [整块] 288                                    │
+ │ (RoPE freq_cis)  [老格式遗留,跳过] 12,288                      │
+ │ wcls ──► 复用 token_embedding(偏移0,文件不单独存)            │
+ └──────────────────────────────────────────────────────────────┘
+   校验: 28 + 15,204,000 × 4 = 60,816,028 ✓
+```
+
+### 关键结构特征
+
+**① type-major 布局(按权重类型分组,不是按层)**
+
+文件里是 `[6个Wq][6个Wk][6个Wv][6个Wo][6个w1]...`,**6 个 W_Q 连续摆成一个大块**,放完所有 W_Q 才到 W_K。取第 l 层用块内偏移:
+```c
+matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);  // l=0→偏移0, l=1→82944, ...
+```
+原因:`export.py` 导出时 `for layer: write(layer.wq)` 把同类权重收集着写,加载端 `ptr += n_layers*dim*dim` 一句跳过整块,代码极简。
+
+**② 每层 W_Q/W_K/W_V 互不共享** —— 6 层 = 6 套完全独立的权重。元素数 497,664 = 6×82,944 本身就是证据(共享的话只会存 1 份)。这是 Transformer 标准设计:浅层抓局部/语法,深层抓语义,需各自的变换。
+
+**③ 谁分层 / 谁整块**
+
+| 整块(全模型1份) | 分层(块内6个独立子块) |
+|------------------|----------------------|
+| token_embedding, rms_final, wcls(=embedding) | wq/wk/wv/wo, w1/w2/w3, rms_att/rms_ffn |
+
+### 占比
+
+```
+ token_embedding ████████████████ 35.2 MiB (60%) ← 词表大,占一多半
+ w1+w2+w3 (FFN)  ██████           15.2 MiB (26%)
+ wq+wk+wv+wo     ████              7.6 MiB (13%)
+```
+
+---
+
+## 6. 关键维度概念:dim / hidden_dim / head_size / seq_len
+
+### dim(288)= token 嵌入向量长度 = 主干隐藏状态宽度
+
+`dim` 既是**每个 token embedding 向量的长度**,也是**整个主干隐藏状态 `x` 的宽度**。嵌入是它的起点,之后一路保持这个尺寸流过所有层(注意力、残差、层间传递全是 288)。
+
+```c
+float* content_row = w->token_embedding_table + token * dim;  // 取一行=288个float
+cudaMemcpy(x, content_row, dim*sizeof(float), ...);            // 直接当初始 x 用
+```
+> 嵌入维度必须 = 模型维度,因为嵌入出来直接当隐藏状态用。
+
+### hidden_dim(768)= FFN 内部临时加宽的宽度
+
+**不是**任何 token 向量的长度。只在 FFN 内部短暂出现:进 FFN 时 W1/W3 把 288 **升到** 768,做 SwiGLU 非线性,再用 W2 **降回** 288。出了 FFN 这个尺寸就消失。
+
+```
+ x[288] ─W1/W3─▶ [768] ─SwiGLU─▶ [768] ─W2─▶ x[288]
+         升维         在宽处算激活        降回
+```
+意义:给模型更大的非线性表达空间。惯例 `hidden_dim ≈ 2.7×~4× dim`(本模型 768/288≈2.67×,SwiGLU 双路所以用 2.67× 而非 4×)。
+
+| | dim (288) | hidden_dim (768) |
+|--|-----------|------------------|
+| 是 token 向量长度吗 | ✅ 是 | ❌ 不是 |
+| 作用范围 | 全程 | 仅 FFN 内部 |
+| 持续性 | 恒定 | 升上去马上降回 |
+
+### head_size(48)= dim / n_heads
+
+注意力把 288 维切成 6 个头,每个头 48 维(`288/6`)。
+
+### seq_len(256)= 最大上下文长度
+
+**就是上下文长度,且是最大值**。prompt + 生成的总 token 数不能超过它。两层原因:
+1. **训练时**:位置编码(RoPE)是在这个长度范围内学的,超了效果差(Llama-3.1 的 rope scaling 就是为扩展它)。
+2. **推理时**:KV Cache 和注意力分数缓冲按它预分配显存:
+```c
+cudaMalloc(&s->key_cache,   n_layers * seq_len * kv_dim * sizeof(float));
+cudaMalloc(&s->value_cache, n_layers * seq_len * kv_dim * sizeof(float));
+cudaMalloc(&s->att,         n_heads  * seq_len          * sizeof(float));
+```
+`main()` 里 `steps` 超过 seq_len 会被强制截断。seq_len 越大越吃显存——这是长上下文模型吃显存的根源。
+
+---
+
+## 7. hidden_states / 隐藏状态
+
+`hidden_states` = 一个 token 在网络**内部**当前的向量表示。代码里就是那个贯穿全程的 `x`(长度 dim=288)。
+
+- "hidden" = 网络内部中间表示,既非输入(token id)也非输出(logits)。
+- "state" = 表示"这个 token 此刻被理解成了什么",每过一层被更新一次。
+
+```c
+float *x = s->x;                      // x 就是 hidden_states
+cudaMemcpy(x, content_row, ...);      // 初始 = 词嵌入
+for (l=0; l<n_layers; l++) {
+    rmsnorm(s->xb, x, ...);           // 拿当前 hidden_states 算
+    accum(x, s->xb2, dim);            // 注意力结果加回 → 更新
+    accum(x, s->xb,  dim);            // FFN 结果加回 → 再更新
+}
+matmul(logits, x, w->wcls, ...);      // 最终 hidden_states → logits
+```
+
+| 名字 | 是什么 | 长度 |
+|------|--------|------|
+| token id | 整数(词表编号) | 标量 |
+| embedding | token 的**初始**向量 | dim=288 |
+| **hidden_states (x)** | token 在**中间层**的当前向量 | dim=288 |
+| logits | **最终**词表分数 | vocab=32000 |
+
+> embedding 是 hidden_states 的起点;hidden_states 是 embedding 过若干层加工后的样子;长度始终 288。`~/infer` 项目用 HuggingFace 风格直接叫 `hidden_states`,llama2.cu 精简叫 `x`,同一个东西。
+
+---
+
+## 8. Tokenizer 分词器
+
+负责**字符串 ↔ token id 互转**,基于 **BPE(Byte Pair Encoding)**。
+
+### 结构体(run.cu:773)
+```c
+typedef struct { char *str; int id; } TokenIndex;  // 一个"词→id"条目
+
+typedef struct {
+    char** vocab;                  // id→字符串。vocab[id]=第id个token的文字
+    float* vocab_scores;           // 每个token的合并分数,BPE 编码时决定先合并谁
+    TokenIndex *sorted_vocab;      // 按字符串排序,用于"字符串→id"二分查找
+    int vocab_size;                // 32000
+    unsigned int max_token_length; // 最长token字符数
+    unsigned char byte_pieces[512];// 256个单字节兜底片段(UTF-8兜底)
+} Tokenizer;
+```
+
+| 字段 | 作用 | 方向 |
+|------|------|------|
+| `vocab` | id→文字 | decode |
+| `vocab_scores` | 合并优先级(总是先合并分数最高的相邻对) | encode |
+| `sorted_vocab` | 字符串→id 二分查找 | encode |
+| `byte_pieces` | 词表没收录的字符退回按字节输出 | decode |
+
+两个出口:`encode`(字符串→token)、`decode`(token→字符串)。
+
+### build_tokenizer 在干什么
+
+**初始化分词器**:开内存 + 填 256 字节兜底 + 从 `tokenizer.bin` 读整张词表。只"装载",不做翻译。
+
+```c
+void build_tokenizer(Tokenizer* t, char* path, int vocab_size) {
+    t->vocab_size = vocab_size;              // ① 文件没存,从 config 传(作者吐槽 sigh)
+    t->vocab        = malloc(...);           // ② 开指针数组(还没填内容)
+    t->vocab_scores = malloc(...);
+    t->sorted_vocab = NULL;                  //    "字符串→id"索引懒加载(encode首次用才建)
+    for (i<256) { byte_pieces[i*2]=i; ... }  // ③ 预填256个单字节字符串(UTF-8兜底)
+    fread(&t->max_token_length, ...);        // ④ 读文件:先读最长token长度
+    for (i<vocab_size) {
+        fread(vocab_scores+i, float);        //    读分数
+        fread(&len, int); vocab[i]=malloc(len+1); fread(vocab[i], len);  // 读长度+字符串
+        vocab[i][len]='\0';
+    }
+}
+```
+
+**tokenizer.bin 格式**(被这段代码揭示):
+```
+[max_token_length:int] 然后 32000 条 [score:float][len:int][bytes:变长]
+```
+
+设计细节:`sorted_vocab` 懒加载(decode 用不上,省启动开销);`byte_pieces` 提前填好做 UTF-8 兜底;每个 vocab[i] 按 len 单独 malloc(token 变长)。
+
+---
+
+## 9. prefill 阶段
+
+**有 prefill 的"逻辑",但没有 prefill 的"优化"。**
+
+`generate()` 里 prefill 和 decode 共用同一个循环、同一个 `forward()`,区别只在「下一个 token 从哪来」:
+
+```c
+while (pos < steps) {
+    forward(transformer, token, pos);          // 永远只喂 1 个 token
+    if (pos < num_prompt_tokens - 1)
+        next = prompt_tokens[pos + 1];          // 还在prompt:强行喂下一个prompt token(不采样)
+    else
+        next = sample(sampler, logits);         // prompt跑完:才真正采样
+    pos++;
+}
+```
+
+所以"prefill"= 前 num_prompt_tokens 步丢弃输出、强喂 prompt token,只为把 K/V 填进 KV Cache。
+
+| | 真正的 prefill(如 ~/infer) | llama2.cu |
+|--|---------------------------|-----------|
+| 处理 prompt | 一次性**并行**整个 prompt | **逐 token 串行** |
+| forward 输入 | `[1, prompt_len]` 一批 | 单个 token |
+| attention kernel | 专门 prefill flash-attn | 与 decode 共用 |
+| prompt 长时 | 收益大 | 线性变慢 |
+
+`forward(transformer, token, pos)` 签名只接收单个 `int token`,根本没有批处理序列的能力 —— 这是它"教学优先、不要性能"取舍的又一体现。
+
+---
+
+## 10. 观测日志(read_checkpoint + memory_map_weights)
+
+本仓库在加载阶段加了观测日志(走 stderr,不污染 stdout 生成文本),启动即打印:
+
+**Config 头**:dim/hidden_dim/n_layers/n_heads/n_kv_heads/head_size/vocab/seq_len/shared_weights/file_size。
+
+**权重布局表**:每个权重块的形状、总元素、是否分层(`L×`=按层细分 / `—`=整块)、单层元素、偏移。例:
+```
+名称                形状              总元素    分层   单层元素    偏移
+token_embedding...  (vocab, dim)     9216000   —     (整块)         0
+wq                  (layer, dim, Qd)  497664   L×      82944    9217728
+w1                  (layer, hidden..) 1327104  L×     221184   11210112
+...
+wcls                (vocab, dim)     9216000   —     (整块)         0  ← 与embedding共享
+```
+
+`L×` 列直接体现:wq/wk/wv/wo/w1/w2/w3/rms_att/rms_ffn 都是块内按 6 层细分、各层独立;token_embedding/rms_final/wcls 是整块共享。换更大的模型(如 stories110M)跑一遍,所有数字相应变化,结构不变。
+
+代码位置:`Config` 注释 @60,`read_checkpoint` 日志 @~280,`memory_map_weights` 日志 @~246。
+
+---
+
+## 相关文档
+- 推理流程逐阶段拆解:`docs/transformer-inference.md`(含 Mermaid + ASCII 图)
+- 交互网页版:`docs/transformer-inference.html`
+- 编译运行指南:`BUILD_AND_RUN.md`
