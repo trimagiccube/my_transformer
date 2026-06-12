@@ -11,6 +11,7 @@
 2. [命令行参数](#2-命令行参数)
 3. [run.c vs runq.c](#3-runc-vs-runqc)
 4. [核心数据结构](#4-核心数据结构)
+4.5 [三个 build 函数:初始化流程](#45-三个-build-函数初始化流程)
 5. [模型文件 .bin 布局](#5-模型文件-bin-布局)
 6. [关键维度概念](#6-关键维度概念-dim--hidden_dim--head_size--seq_len)
 7. [hidden_states / 隐藏状态](#7-hidden_states--隐藏状态)
@@ -133,6 +134,79 @@ int seq_len;     // 最大序列长度          256
 | 输出 | `logits/logits_gpu` | 每步末尾 | 词表分数,拷回 CPU 采样 |
 
 **设计要点**:所有 buffer 在 `malloc_run_state()` **启动时一次性 cudaMalloc**,之后每 token / 每层复用同一块显存,不在热路径反复申请。结构体在主机,但每个 `float*` 指向 GPU(`logits` 例外,在 CPU,因为采样在 CPU)。
+
+---
+
+## 4.5 三个 build 函数:初始化流程
+
+`main()` 在跑推理前调用三个 `build_*`,分别把 Config+Weights+RunState、词表、采样器准备好。它们都只做"装载/分配",不做计算。
+
+```
+main()
+├─ build_transformer(&t, model.bin)   →  t.config / t.weights / t.state
+├─ build_tokenizer(&tok, tokenizer.bin, vocab_size)  →  tok.vocab / vocab_scores
+└─ build_sampler(&s, vocab_size, temp, topp, seed)   →  s.temperature / topp / probindex
+```
+
+### build_transformer — 加载模型(权重 + 缓冲)
+
+它本身极薄,只串起两步:
+
+```c
+void build_transformer(Transformer *t, char* checkpoint_path) {
+    read_checkpoint(checkpoint_path, &t->config, &t->weights, ...);  // ① 读 config + 加载权重
+    malloc_run_state(&t->state, &t->config);                        // ② 按 config 开 RunState 缓冲
+}
+```
+
+**① read_checkpoint**(详见第 5 节):
+```
+fopen → fread 28字节Config头 → 处理 shared_weights(vocab<0) → 求文件大小
+     → mmap 整个文件 → (GPU) cudaMalloc 权重区并 cudaMemcpy 上显存
+     → memory_map_weights() 把大指针按布局切成 token_embedding/wq/wk/.../wcls
+```
+
+**② malloc_run_state**:Config 读出来后才知道各 buffer 多大,这步**一次性 cudaMalloc** 所有激活缓冲(`x/xb/q/k/v/hb/att/...` 按 dim/hidden_dim,KV Cache 和 att 按 seq_len),之后整个推理复用、不再申请。`logits` 用 calloc 在 CPU(采样在 CPU)。
+
+> 所以 `build_transformer` = **read_checkpoint(加载只读权重) + malloc_run_state(分配可写缓冲)**,正好对应"模型"和"草稿纸"两块。
+
+### build_tokenizer — 加载词表
+
+```c
+void build_tokenizer(Tokenizer* t, char* path, int vocab_size) {
+    t->vocab_size = vocab_size;              // ① 文件没存,从 config 传
+    t->vocab/vocab_scores = malloc(...);     // ② 开数组
+    t->sorted_vocab = NULL;                  //    字符串→id 索引懒加载(encode首次用才建)
+    for(i<256) byte_pieces[...] = i;         // ③ 预填256个单字节兜底(UTF-8)
+    fread(max_token_length); 循环读32000条:[score][len][bytes]  // ④ 读整张词表
+}
+```
+细节见[第 8 节](#8-tokenizer-分词器)。只装载、不翻译。
+
+### build_sampler — 初始化采样器
+
+最简单,存几个采样参数 + 开一个 top-p 用的缓冲:
+
+```c
+void build_sampler(Sampler* s, int vocab_size, float temperature, float topp, ull seed) {
+    s->vocab_size = vocab_size;
+    s->temperature = temperature;   // -t,0=贪婪
+    s->topp = topp;                 // -p,核采样阈值
+    s->rng_state = seed;            // -s,随机种子
+    s->probindex = malloc(vocab_size * sizeof(ProbIndex));  // top-p 排序用的临时缓冲
+}
+```
+`Sampler` 结构体(run.cu:994):`vocab_size / probindex / temperature / topp / rng_state`。运行时 `sample()` 用这些参数从 logits 选 token。
+
+### 三者对比
+
+| | build_transformer | build_tokenizer | build_sampler |
+|--|-------------------|-----------------|---------------|
+| 加载来源 | 模型 `*.bin` | `tokenizer.bin` | 无(纯参数) |
+| 产出 | config + 权重(GPU) + RunState 缓冲 | 词表(CPU) | 采样参数 + probindex |
+| 加载方式 | mmap + cudaMemcpy | fread 逐项 | malloc |
+| 数据落点 | 权重在 GPU,RunState 在 GPU | CPU | CPU |
+| 是否做计算 | 否(只加载/分配) | 否 | 否 |
 
 ---
 
