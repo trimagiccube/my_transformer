@@ -365,30 +365,104 @@ int divUp(int a, int b) {
 const int num_threads_lrg = 1024;
 const int num_threads_med = 256;
 
+// ============================================================================
+// RMSNorm(Root Mean Square Normalization,均方根归一化)
+//
+// ★ 一句话直觉:把向量"调到统一音量,但不改旋律",再逐维微调。
+//   目的是让每层拿到的数值都在稳定范围内,不会越传越大而失控。
+//
+// ─────────────────────── 用具体数字走一遍(假设只有4维)───────────────────────
+//   输入 x = [3, -4, 2, 1]
+//   ① 算"整体音量" RMS:每个数平方→求平均→开根号
+//        平方: [9, 16, 4, 1] → 和=30 → /4=7.5 → √7.5 ≈ 2.74  (这就是 RMS)
+//   ② 每个数都 ÷ 2.74(除的是同一个数!所以形状/正负/相对大小都不变):
+//        [3,-4,2,1] / 2.74 = [1.10, -1.46, 0.73, 0.37]
+//   ③ 再 × weight(每维一个,训练学出来的"音量微调"):
+//        归一化 [1.10,-1.46,0.73,0.37] ⊙ weight [1.0,2.0,0.5,1.5]
+//        = [1.10, -2.92, 0.37, 0.55]  ← 输出 o
+//
+//   归一化前后对比(柱子相对高低/正负完全不变,只是整体缩到标准大小):
+//
+//     归一化前 x:                          归一化后 (÷2.74):
+//      3 │ ██▌                              1.10 │ ██▌
+//      2 │ █▌            ── ÷ 2.74 ──►       0.73 │ █▌
+//      1 │ ▌                                0.37 │ ▌
+//      0 ┼────────                          0.00 ┼────────
+//     -4 │███▌                             -1.46 │███▌
+//          x0 x1 x2 x3                             x0 x1 x2 x3
+//        (整体偏大、起伏大)                  (拉回标准音量,但起伏比例一模一样)
+//
+//   类比:每层是接力选手,向量越传可能越"吵"。RMSNorm 是每层入口的"音量旋钮",
+//        不管进来多大声,先统一调到标准音量再往下算 → 数值稳定。
+//
+// ─────────────────────── 输入 / 输出(都是长度 dim=288 的【向量】)──────────────
+//   x[288]      ← 输入:当前隐藏状态(一个 token 的向量)
+//   weight[288] ← 每维的可学习增益(见下"weight 说明")
+//   o[288]      → 输出:归一化并按 weight 缩放后的向量
+//
+//   公式:o[i] = (x[i] / rms) · weight[i],  其中 rms = sqrt(mean(x²)+ε)
+//   注意:rms 对【整个向量】只算一次(标量),广播给每维;weight 是逐维相乘。
+//
+//   ★ "× weight" 是【逐元素相乘 ⊙】(Hadamard),不是点乘、不是矩阵乘!
+//     即 o[i] = 归一化值[i] · weight[i],下标一一对应,各维独立,不跨维求和。
+//        归一化 [a0, a1, ..., a287]
+//                ×    ×         ×        ← 对位相乘
+//        weight [g0, g1, ..., g287]
+//        输出 o [a0·g0, a1·g1, ..., a287·g287]   ← 仍是 288 维【向量】
+//     判别窍门:输出还是 288 维 → 逐元素乘;若变成 1 个标量 → 那才是点乘(这里不是)。
+//     原因:weight 的意义是"给每一维单独配一个增益",所以必须对位、各维独立。
+//   没有矩阵乘:RMSNorm = "一次全局归约(求rms)+ 逐元素缩放",不涉及矩阵乘法。
+//
+// ─────────────────────── weight 说明(常被问到)──────────────────────────────
+//   • 它是 RMSNorm 里唯一可学习的参数(归一化那步是纯计算、无参数)。
+//   • 形状 = 长度 dim=288 的【一维向量】(不是矩阵!),值多在 1.0 附近。
+//   • 文件里有三个、且【每层各一套】(rms_final 除外):
+//       rms_att_weight   每层1个(注意力前norm)  → 6层共 6×288=1728
+//       rms_ffn_weight   每层1个(FFN前norm)     → 6层共 1728
+//       rms_final_weight 全模型仅1个(收尾norm)  → 288
+//     取第 l 层:w->rms_att_weight + l*dim。HF 里对应 input_layernorm.weight 等。
+//
+// ─────────────────────── 为什么"一进层就 norm"(Pre-Norm)─────────────────────
+//   Llama 用 Pre-Norm:先 norm 再做 QKV/FFN(norm 是变换前的"预处理",不是收尾)。
+//   QKV 投影吃的是归一化后的 xb,不是原始 x。且残差捷径用的是【原始 x】,所以
+//   norm 输出写到 xb、x 保持不变:  x ──norm──► xb ──变换──► 结果;  x + 结果 = 新x
+//   (2017 原始 Transformer 是 Post-Norm:先变换后 norm;现代大模型多改用 Pre-Norm,更稳)
+//
+// ─────────────────────── GPU 实现(三阶段)──────────────────────────────────
+//   <<<1, 1024>>> 一个 block、1024 线程协作处理这一个向量:
+//   x: [x0 x1 ... x287]
+//        │① 平方求和(1024线程各算部分和 → cub::BlockReduce 合成1个总和)
+//        ▼
+//      Σx² ─/n─► 均方 ─+ε, 1/sqrt─► ss(②由0号线程算出的标量,广播给全部线程)
+//        │③ 逐元素缩放
+//        ▼
+//   o: [g0·ss·x0 , g1·ss·x1 , ... , g287·ss·x287]   (g=weight)
+// ============================================================================
 __global__ void rmsnorm_kernel(float* o, float* x, float* weight, int size, int elementsPerThread) {
-    // parallel reduction of sum of squares via CUB
+    // —— 阶段①:归约求平方和 —— 每个线程先累加自己负责那几个元素的 x[j]²
     float ss = 0.0f;
     for (int i = 0; i < elementsPerThread; i++) {
-        int j = threadIdx.x + i * num_threads_lrg;
+        int j = threadIdx.x + i * num_threads_lrg;   // 线程 t 负责 t, t+1024, t+2048...
         if (j < size)
             ss += x[j] * x[j];
     }
+    // 1024 个线程各自的部分和 → CUB 合成 1 个全局平方和(这就是"归约")
     using BlockReduce = cub::BlockReduce<float, num_threads_lrg>;
     __shared__ typename BlockReduce::TempStorage temp;
     ss = BlockReduce(temp).Sum(ss);
 
-    // serialization point to calculate normalization factor 
+    // —— 阶段②:由 0 号线程算出缩放因子 ss = 1/sqrt(均方+ε),放进共享内存广播 ——
     __shared__ float shared_ss;
     if (threadIdx.x == 0) {
-        ss /= size;
-        ss += 1e-5f;
-        ss = 1.0f / sqrtf(ss);
+        ss /= size;            // 均方 = 平方和 / n
+        ss += 1e-5f;           // 加 ε 防止除零
+        ss = 1.0f / sqrtf(ss); // ss = 1 / rms
         shared_ss = ss;
     }
-    __syncthreads();
-    ss = shared_ss;
+    __syncthreads();           // 等 0 号线程算完,其余线程才能读
+    ss = shared_ss;            // 所有线程拿到同一个标量 ss
 
-    // normalize and scale
+    // —— 阶段③:逐元素归一化+缩放 —— o[i] = weight[i] · (ss · x[i])
     for (int i = 0; i < elementsPerThread; i++) {
         int j = threadIdx.x + i * num_threads_lrg;
         if (j < size) {
@@ -748,7 +822,8 @@ float* forward(Transformer* transformer, int token, int pos) {
     // forward all the layers
     for(unsigned long long l = 0; l < p->n_layers; l++) {
 
-        // attention rmsnorm
+        // 第 1 步:注意力前 RMSNorm。输入 x[288],用本层增益 rms_att_weight(+l*dim 定位第l层),
+        // 输出归一化后的 xb[288]。x 本身不变(残差要用),结果写到 xb 供 QKV 投影。详见 rmsnorm_kernel。
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
 
         // ---- 在 KV Cache 这块大数组里定位"当前层 l、当前位置 pos"的 K/V 槽位 ----
