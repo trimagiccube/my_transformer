@@ -551,16 +551,24 @@ void RoPe_rotation(int pos, RunState* s, int dim, int kv_dim, int head_size) { /
 
 #ifdef USE_CUDA
 // TODO refactor vs C code
+// 每个 block 负责一个 Q 头(blockIdx.x = h),块内 1024 线程协作:打分→softmax→加权求V
 __global__ void multi_head_attention_kernel(int pos, int seq_len, float *sq, float *satt, float *sxb, float *key_cache, float *value_cache, int kv_dim, int kv_mul, int head_size, int loff) {
-    int h = blockIdx.x;
+    int h = blockIdx.x;             // 当前 Q 头编号 (0 .. n_heads-1)
     // get the query vector for this head
     float* q = sq + h * head_size;
     // attention scores for this head
     float* att = satt + h * seq_len;
-    // iterate over all timesteps, including the current one 
+    // iterate over all timesteps, including the current one
     // In CUDA, each thread does a small portion of the calc
     for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
-        // get the key vector for this head and at this timestep
+        // ---- GQA/MHA 的头映射就在这里:第 h 个 Q 头去读第 (h/kv_mul) 个 KV 头 ----
+        //   MHA(本模型 kv_mul=1):h/1 = h   → Q头h 读 KV头h(1:1,每Q独享一组KV)
+        //   GQA(kv_mul=2 为例)   :h/2      → Q0,Q1→KV0;Q2,Q3→KV1(多Q共享一组KV)
+        //
+        //     Q头:  [Q0][Q1][Q2][Q3][Q4][Q5]      Q头: [Q0 Q1][Q2 Q3][Q4 Q5]
+        //   MHA      │   │   │   │   │   │      GQA      └┬─┘  └┬─┘  └┬─┘
+        //     KV头: [K0][K1][K2][K3][K4][K5]      KV头:  [K0]  [K1]  [K2]
+        //   (h/kv_mul) 把 Q 头索引折算成它该读的 KV 头索引;乘 head_size 跳到该 KV 头起点
         float* k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
         // calculate the attention score as the dot product of q and k
         float score = 0.0f;
@@ -586,7 +594,7 @@ __global__ void multi_head_attention_kernel(int pos, int seq_len, float *sq, flo
     for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
         float val = 0.0f;
         for (int t = 0; t <= pos; t++) {
-            // get the value vector for this head and at this timestep
+            // 同理:第 h 个 Q 头读第 (h/kv_mul) 个 KV 头的 V(MHA 时即第 h 个)
             float* v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
             // get the attention weight for this timestep
             float a = att[t];
@@ -689,18 +697,44 @@ void accum(float *a, float *b, int size) {
 
 float* forward(Transformer* transformer, int token, int pos) {
 
-    // a few convenience variables
-    Config* p = &transformer->config;
-    TransformerWeights* w = &transformer->weights;
-    RunState* s = &transformer->state;
-    float *x = s->x;
-    int dim = p->dim;
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
-    int hidden_dim =  p->hidden_dim;
-    int head_size = dim / p->n_heads;
+    // ====================== 便捷别名(只为少打字,无计算)======================
+    Config* p = &transformer->config;            // 超参蓝图
+    TransformerWeights* w = &transformer->weights;// 权重(显存)
+    RunState* s = &transformer->state;            // 激活缓冲(草稿纸)
+    float *x = s->x;                              // 主干隐藏状态,贯穿全程,长度=dim
 
-    // copy the token embedding into x
+    // ====================== 关键维度量(后面反复用)==========================
+    int dim        = p->dim;                      // 288  主干维度 = token 向量长度
+    int hidden_dim = p->hidden_dim;               // 768  FFN 内部膨胀维度(升维→激活→降回)
+    int head_size  = dim / p->n_heads;            // 48   每个注意力头的维度 = dim / n_heads
+
+    // --- 下面两个是为 GQA(分组查询注意力)通用性准备的 ---
+    // kv_dim:K/V 向量的总维度 = head_size × n_kv_heads。
+    //   普通 MHA:n_kv_heads == n_heads → kv_dim == dim(本模型 288)
+    //   GQA     :n_kv_heads <  n_heads → kv_dim <  dim(K/V 更少,省 KV Cache)
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    // kv_mul:多少个 Q 头共用一组 K/V = n_heads / n_kv_heads。
+    //   MHA → 1(每个 Q 头独享自己的 K/V);GQA → >1(几个 Q 头挤一组 K/V)
+   int kv_mul = p->n_heads / p->n_kv_heads;
+    //
+    //        n_heads=6 个 Q 头                 n_kv_heads 个 KV 头
+    //   MHA  [Q0][Q1][Q2][Q3][Q4][Q5]    →    [KV0][KV1][KV2][KV3][KV4][KV5]  kv_mul=1
+    //   GQA  [Q0 Q1][Q2 Q3][Q4 Q5]       →    [ KV0 ][ KV1 ][ KV2 ]           kv_mul=2
+    //         └每2个Q头共享1组KV┘               (本模型是上面的 MHA:kv_dim=288, kv_mul=1)
+
+    // 用 token id 做"行索引",在词嵌入表里定位该 token 那一行 embedding 的起始指针。
+    // token_embedding_table 逻辑上是 [vocab, dim],内存里一维连续铺开;按行寻址:
+    // 第 i 行起点 = 基址 + i*dim(经典二维数组寻址)。这是每步唯一一次"喂数据上 GPU"。
+    //
+    //   token_embedding_table  (一维连续, 逻辑 32000 × 288)
+    //   ┌───────┬───────┬───────┬─────┬────────┐   每行 = dim = 288 个 float
+    //   │ 行 0  │ 行 1  │ 行 2  │ ... │行 31999│
+    //   └───────┴───────┴───────┴─────┴────────┘
+    //   ▲                       ▲
+    //   基址              +token*dim ──► content_row(第 token 行开头)
+    //                            └─ 这 288 个 float 就是该 token 的 embedding
+    //
+    // 注意:这里只是"算地址"(指针偏移,不搬数据);真正复制由下面的 memcpy/cudaMemcpy 完成。
     float* content_row = w->token_embedding_table + token * dim;
 #ifdef USE_CUDA
     CUCHK(cudaMemcpy(x, content_row, dim*sizeof(*x), cudaMemcpyHostToDevice));
@@ -714,10 +748,20 @@ float* forward(Transformer* transformer, int token, int pos) {
         // attention rmsnorm
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
 
-        // key and value point to the kv cache
-        int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
-        s->k = s->key_cache + loff + pos * kv_dim;
-        s->v = s->value_cache + loff + pos * kv_dim;
+        // ---- 在 KV Cache 这块大数组里定位"当前层 l、当前位置 pos"的 K/V 槽位 ----
+        // KV Cache 内存布局是 [layer][seq_len][kv_dim],定位要两级偏移:
+        //
+        //   key_cache: ┌──────── 层0 ────────┬──── 层1 ────┬ ... ┬─ 层(L-1) ─┐
+        //              │pos0 pos1 ... pos(S-1)│             │     │           │
+        //              └──────────────────────┴─────────────┴─────┴───────────┘
+        //               │← seq_len × kv_dim ─→│  每层这么大
+        //
+        //   loff          = l * seq_len * kv_dim   → 先跳过前面 l 层,定位到第 l 层起点
+        //   + pos * kv_dim                          → 再在本层内跳到第 pos 个 token 的槽位
+        int loff = l * p->seq_len * kv_dim;       // 第 l 层在 KV Cache 里的起始偏移
+        s->k = s->key_cache + loff + pos * kv_dim;   // 当前(层l,位置pos)的 K 写入点
+        s->v = s->value_cache + loff + pos * kv_dim; // 当前(层l,位置pos)的 V 写入点
+        // 接着的 matmul(s->k, ...) 算出的 K 会直接落进这个槽位 = 同时完成"算K"和"缓存K"
 
         // qkv matmuls for this position
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
