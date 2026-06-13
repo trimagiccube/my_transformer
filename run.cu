@@ -737,6 +737,9 @@ float* forward(Transformer* transformer, int token, int pos) {
     // 注意:这里只是"算地址"(指针偏移,不搬数据);真正复制由下面的 memcpy/cudaMemcpy 完成。
     float* content_row = w->token_embedding_table + token * dim;
 #ifdef USE_CUDA
+    // 注:content_row 实为【显存】指针(token_embedding_table 已被 read_checkpoint
+    // 当作权重区一部分拷到显存)。故此处实质是 显存→显存 取一行到 x;cudaMemcpyKind
+    // 写成 HostToDevice 不严谨(应为 DeviceToDevice),靠 CUDA UVA 自动识别才能跑通。
     CUCHK(cudaMemcpy(x, content_row, dim*sizeof(*x), cudaMemcpyHostToDevice));
 #else
     memcpy(x, content_row, dim*sizeof(*x));
