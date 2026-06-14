@@ -143,6 +143,14 @@ void malloc_run_state(RunState* s, Config* p) {
     CUCHK(cudaMalloc((void**)&s->hb, p->hidden_dim * sizeof(float)));
     CUCHK(cudaMalloc((void**)&s->hb2, p->hidden_dim * sizeof(float)));
     CUCHK(cudaMalloc((void**)&s->q, p->dim * sizeof(float)));
+    // ---- KV Cache:显存里缓存所有历史 token 的 K/V,供注意力复用(启动时一次性开满)----
+    //   大小 = n_layers × seq_len × kv_dim × sizeof(float),K 和 V 各一份。
+    //   stories15M:6 × 256 × 288 × 4B = 1,769,472B ≈ 1.69 MiB 一份,K+V ≈ 3.4 MiB。
+    //   • 按 seq_len(最大长度)预留:即使只生成几个 token 也开满 256 个位置(避免运行时反复申请)。
+    //   • 用 kv_dim 而非 dim:本模型 MHA 时 kv_dim=dim=288;GQA 时 kv_dim 更小 → KV Cache 显著缩小。
+    //   • 布局 [layer][seq_len][kv_dim];forward 里用 loff+pos*kv_dim 定位"当前层当前位置"槽位。
+    //   ⚠ 大模型会爆炸:Llama-2-7B(32层,seq=4096,kv_dim=4096)单份 ≈2GiB,K+V ≈4GiB
+    //     → 这就是长上下文吃显存的根源,以及 GQA / KV 量化 / PagedAttention 等优化的意义。
     CUCHK(cudaMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
     CUCHK(cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
     CUCHK(cudaMalloc((void**)&s->att, p->n_heads * p->seq_len * sizeof(float)));
