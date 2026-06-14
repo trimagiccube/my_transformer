@@ -865,9 +865,13 @@ float* forward(Transformer* transformer, int token, int pos) {
     int head_size  = dim / p->n_heads;            // 48   每个注意力头的维度 = dim / n_heads
 
     // --- 下面两个是为 GQA(分组查询注意力)通用性准备的 ---
-    // kv_dim:K/V 向量的总维度 = head_size × n_kv_heads。
-    //   普通 MHA:n_kv_heads == n_heads → kv_dim == dim(本模型 288)
-    //   GQA     :n_kv_heads <  n_heads → kv_dim <  dim(K/V 更少,省 KV Cache)
+    // kv_dim:一个位置的 K(或 V)向量总长度 = head_size × n_kv_heads
+    //         = 所有 KV 头拼起来的总维度。代码写法 (dim*n_kv_heads)/n_heads 与之等价。
+    //   本模型(MHA):head_size=48, n_kv_heads=6 → kv_dim = 48×6 = 288 (= dim)
+    //   普通 MHA:n_kv_heads == n_heads → kv_dim == dim
+    //   GQA     :n_kv_heads <  n_heads → kv_dim <  dim(KV头更少,K/V投影和KV Cache都更省)
+    //     例:Llama2-70B head_size=128, n_kv_heads=8 → kv_dim=128×8=1024 < dim=8192
+    //   注:Q 永远是 dim(288=6头×48);只有 K/V 用 kv_dim。
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     // kv_mul:多少个 Q 头共用一组 K/V = n_heads / n_kv_heads。
     //   MHA → 1(每个 Q 头独享自己的 K/V);GQA → >1(几个 Q 头挤一组 K/V)
