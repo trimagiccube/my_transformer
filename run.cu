@@ -416,11 +416,22 @@ const int num_threads_med = 256;
 // ─────────────────────── weight 说明(常被问到)──────────────────────────────
 //   • 它是 RMSNorm 里唯一可学习的参数(归一化那步是纯计算、无参数)。
 //   • 形状 = 长度 dim=288 的【一维向量】(不是矩阵!),值多在 1.0 附近。
+//     注意:长度是 dim(288),不是 vocab(32000)!vocab 只跟 embedding/lm_head 有关。
 //   • 文件里有三个、且【每层各一套】(rms_final 除外):
 //       rms_att_weight   每层1个(注意力前norm)  → 6层共 6×288=1728
 //       rms_ffn_weight   每层1个(FFN前norm)     → 6层共 1728
 //       rms_final_weight 全模型仅1个(收尾norm)  → 288
 //     取第 l 层:w->rms_att_weight + l*dim。HF 里对应 input_layernorm.weight 等。
+//
+//   • 全部 RMSNorm weight 总元素数:
+//       = dim × (n_layers×2 + 1)            ← 每层2个(att前/ffn前) + 1个最终收尾
+//       = 288 × (6×2 + 1) = 288 × 13 = 3744 个 float
+//     ★ 易错点:基数是 dim(288),不是 vocab;那个"+1"是【最终收尾的独立 norm】
+//       (6层全算完后、进 lm_head 前做一次),不是"被6层共享"。各层的 att/ffn norm 也互不共享。
+//
+//       x ─层0─►层1─►...─►层5─►[rms_final 归一化一次]─► lm_head
+//          每层内部各有自己的            ↑ 收尾,全模型仅此一次(非共享)
+//          rms_att + rms_ffn(各层独立)
 //
 // ─────────────────────── 为什么"一进层就 norm"(Pre-Norm)─────────────────────
 //   Llama 用 Pre-Norm:先 norm 再做 QKV/FFN(norm 是变换前的"预处理",不是收尾)。
@@ -446,7 +457,19 @@ __global__ void rmsnorm_kernel(float* o, float* x, float* weight, int size, int 
         if (j < size)
             ss += x[j] * x[j];
     }
-    // 1024 个线程各自的部分和 → CUB 合成 1 个全局平方和(这就是"归约")
+    // ---- 用 NVIDIA CUB 库做"块内归约":把 1024 个线程各自的部分和合并成 1 个总和 ----
+    //   ① cub::BlockReduce<float, 1024>:模板参数 = (归约数据类型, block 内线程数,
+    //      须与 blockDim 一致)。只是定义类型,还没计算。
+    //   ② TempStorage temp:CUB 归约所需的共享内存"工作台"(线程间交换部分结果用),
+    //      __shared__ 表示整个 block 共享;大小由 CUB 按上面的模板参数算好。
+    //   ③ .Sum(ss):传入【每个线程自己】的部分和 ss,CUB 用树形并行规约(log2(1024)=10步,
+    //      两两相加逐层折半)把 1024 个 ss 全加起来。返回的总和只有 0 号线程有效。
+    //
+    //      t0:x0²  t1:x1² ... t287:x287²  t288..1023:0
+    //          └────┬────┴─────┬──────────┘
+    //               ▼ BlockReduce(...).Sum(ss)  (树形规约)
+    //          ss(t0)=Σx² 总平方和(仅 0 号线程拿到 → 下面阶段②用它)
+    //   自己手写块内求和要操心同步/共享内存/warp shuffle/bank冲突,CUB 封装好且高度优化。
     using BlockReduce = cub::BlockReduce<float, num_threads_lrg>;
     __shared__ typename BlockReduce::TempStorage temp;
     ss = BlockReduce(temp).Sum(ss);
@@ -552,11 +575,37 @@ void softmax(float* x, int size) {
     }
 }
 
+// ============================================================================
+// matmul:矩阵 × 向量(线性层/投影)。这是 Transformer 里真正的"矩阵乘",和 RMSNorm
+//   的"逐元素"完全不同 —— 输出的每一维要对输入【整个向量】加权求和。
+//
+//   计算:xout[d] = W[d×n] · x[n]      (W 是权重矩阵,x 是输入向量,xout 是输出向量)
+//
+//   输出第 i 维 = W 的第 i 行 与 x 做点乘(逐元素乘再求和):
+//       xout[i] = Σ_j  W[i][j] · x[j]      (j 从 0 到 n-1)
+//
+//        W (d 行 × n 列)        x (n)        xout (d)
+//       ┌──────────────┐       ┌──┐         ┌──┐
+//   行0 │ w00 w01 .. w0,n-1│·  │x0│   ──►   │y0│ = Σ w0j·xj  ← 行0 点乘 x
+//   行1 │ w10 w11 .. w1,n-1│   │x1│         │y1│ = Σ w1j·xj
+//    .. │      ...         │   │..│         │..│
+//  行d-1│ ...              │   │xn-1│       │yd-1│
+//       └──────────────┘       └──┘         └──┘
+//        每一行 → 输出的一个维度;d 行 → d 维输出。共 d×n 次乘加。
+//
+//   维度变化:n 维输入 → d 维输出(d 可以 = / > / < n,取决于这一层想要的输出宽度)。
+//
+//   为什么调 cuBLAS:矩阵乘是计算量最大、最难写快的部分(本项目里唯一不自写 kernel 的),
+//   直接用 NVIDIA 高度优化的库。Sgemv = Single-precision GEneral Matrix-Vector multiply。
+//
+//   关于转置 CUBLAS_OP_T:权重在内存里按 (n,d) 行主序存(W[j*d + i]),而我们要的是
+//   xout = W^row · x,cuBLAS 列主序视角下需要转置才对得上,故传 CUBLAS_OP_T。
+// ============================================================================
 #ifdef USE_CUDA
 // Use cuBLAS for matmul to leverage this included, high-performance library.
 void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
-    // W is stored in this order: (n=0,d=0), (n=1,d=0), (n=2,d=0), ... 
+    // W is stored in this order: (n=0,d=0), (n=1,d=0), (n=2,d=0), ...
     // so W is n x d in cublas terms & we'll need to transpose.
     // Sgemv does y = alpha * op(A) * x + beta * y (modifying y)
     //   where op can transpose the matrix A
@@ -841,7 +890,25 @@ float* forward(Transformer* transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim; // 当前(层l,位置pos)的 V 写入点
         // 接着的 matmul(s->k, ...) 算出的 K 会直接落进这个槽位 = 同时完成"算K"和"缓存K"
 
-        // qkv matmuls for this position
+        // ======================= 第 2 步:QKV 投影 ===============================
+        // 用三个权重矩阵,把归一化后的隐藏状态 xb[288] 投影成 Query / Key / Value 三个向量。
+        // 这是注意力的"提问/索引/内容"三件套:
+        //   Q (Query 查询):我(当前token)想找什么信息    —— 拿去和别人的 K 打分
+        //   K (Key   键)  :我能被别人按什么"标签"检索到  —— 写入 KV Cache 供以后查
+        //   V (Value 值)  :真正被取走的内容              —— 写入 KV Cache,按注意力权重加权
+        //
+        //   每个都是一次 matmul(矩阵×向量,见 matmul 注释):
+        //        Wq[288×288] · xb[288] → q[288]      (Q 用 dim)
+        //        Wk[kv_dim×288]· xb[288] → k[kv_dim]  (K 用 kv_dim;MHA 时=288)
+        //        Wv[kv_dim×288]· xb[288] → v[kv_dim]  (V 用 kv_dim)
+        //
+        //   注意:输入都是同一个 xb,但乘三个【不同】的权重 → 得到三个不同向量。
+        //   "多头"是逻辑切分:q[288] 其实是 6 个头 ×48 拼在一起,后续按 head_size 切开:
+        //        q: [ 头0(48) | 头1(48) | 头2 | 头3 | 头4 | 头5(48) ]  = 288
+        //   K/V 同理(MHA 时也是 6 头;GQA 时 KV 头更少,见 kv_dim/kv_mul 说明)。
+        //
+        //   +l*dim*dim / +l*dim*kv_dim:在权重大块里定位【第 l 层】的 Wq/Wk/Wv(type-major 布局)。
+        //   s->k / s->v 已指向 KV Cache 当前槽位 → 算完即缓存(见上方 KV Cache 定位注释)。
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
