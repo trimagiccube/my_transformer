@@ -474,16 +474,24 @@ __global__ void rmsnorm_kernel(float* o, float* x, float* weight, int size, int 
     __shared__ typename BlockReduce::TempStorage temp;
     ss = BlockReduce(temp).Sum(ss);
 
-    // —— 阶段②:由 0 号线程算出缩放因子 ss = 1/sqrt(均方+ε),放进共享内存广播 ——
+    // —— 阶段②:把阶段①的【平方和】加工成最终缩放因子 ss = 1/rms,放进共享内存广播 ——
+    //   进来时 ss = 平方和(Σx²)。以 x=[3,-4,2,1] 为例,ss=9+16+4+1=30:
+    //     ① ss /= size       : 30/4 = 7.5        → 均方(mean of squares)
+    //     ② ss += 1e-5f       : 7.5+ε ≈ 7.5       → 加 ε 防止除零/极端值
+    //     ③ ss = 1/sqrtf(ss) : 1/√7.5 ≈ 0.365    → 1/rms,这才是最终缩放因子
+    //   ★ 算的是【倒数 1/rms】而非 rms:因为归一化要"÷rms",而 GPU 上除法比乘法慢,
+    //     先求一次倒数,阶段③就能用快速的乘法 o[i]=x[i]*(1/rms) 代替慢除法。
+    //   ★ 只让 0 号线程算:ss 是整个向量共享的一个标量,1024 线程算出来都一样,
+    //     让一个线程算一次、写进 shared_ss 广播,避免 1024 倍重复计算。
     __shared__ float shared_ss;
     if (threadIdx.x == 0) {
-        ss /= size;            // 均方 = 平方和 / n
-        ss += 1e-5f;           // 加 ε 防止除零
-        ss = 1.0f / sqrtf(ss); // ss = 1 / rms
-        shared_ss = ss;
+        ss /= size;            // ① 平方和 → 均方(/ n)
+        ss += 1e-5f;           // ② 加 ε 防止除零
+        ss = 1.0f / sqrtf(ss); // ③ 取 1/sqrt → ss = 1/rms(例:30→7.5→0.365)
+        shared_ss = ss;        // ④ 写入共享内存,准备广播给其余线程
     }
-    __syncthreads();           // 等 0 号线程算完,其余线程才能读
-    ss = shared_ss;            // 所有线程拿到同一个标量 ss
+    __syncthreads();           // 屏障:等 0 号线程算完写好,其余线程才能读
+    ss = shared_ss;            // 所有线程拿到同一个标量 ss(=1/rms,例 0.365)
 
     // —— 阶段③:逐元素归一化+缩放 —— o[i] = weight[i] · (ss · x[i])
     for (int i = 0; i < elementsPerThread; i++) {
