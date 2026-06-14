@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RoPE 交互可视化 · 旋转位置编码</title>
+<style>
+  :root{
+    --bg:#070b16; --panel:#0f1a2e; --panel2:#13213a; --line:#1e2d49;
+    --text:#dce6f5; --muted:#8497b8; --dim:#5c6f92;
+    --q:#38bdf8; --k:#f472b6; --in:#5c6f92; --accent:#a855f7; --ok:#34d399;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;
+    --mono:'SF Mono','JetBrains Mono',Consolas,Menlo,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.7;
+    background-image:radial-gradient(900px 600px at 80% -10%,rgba(56,189,248,.10),transparent),
+                     radial-gradient(700px 500px at 0% 10%,rgba(168,85,247,.08),transparent);
+    background-attachment:fixed;}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 22px}
+  header{padding:56px 0 30px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:2px;text-transform:uppercase;color:var(--q);margin-bottom:10px}
+  h1{font-size:clamp(28px,5vw,46px);font-weight:800;letter-spacing:-1px;line-height:1.1}
+  .grad{background:linear-gradient(100deg,#38bdf8,#a855f7 60%,#f472b6);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .lead{font-size:17px;color:var(--muted);max-width:760px;margin-top:16px}
+  section{padding:30px 0;border-top:1px solid rgba(30,45,73,.5)}
+  h2{font-size:24px;font-weight:750;letter-spacing:-.3px;margin-bottom:6px}
+  h2 .n{font-family:var(--mono);color:var(--accent);margin-right:8px}
+  .sub{color:var(--muted);font-size:15px;margin-bottom:18px;max-width:780px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:24px;align-items:center}
+  @media(max-width:760px){.row{grid-template-columns:1fr}}
+  canvas{display:block;width:100%;max-width:340px;margin:0 auto;border-radius:12px;background:#0a1120;border:1px solid var(--line)}
+  .ctrl{margin-top:14px}
+  .ctrl label{display:flex;justify-content:space-between;font-size:14px;color:var(--muted);margin-bottom:6px}
+  .ctrl label b{font-family:var(--mono);color:var(--q)}
+  input[type=range]{width:100%;accent-color:var(--q);height:6px}
+  .readout{font-family:var(--mono);font-size:13.5px;background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:12px 14px;margin-top:14px;line-height:1.9}
+  .readout .lbl{color:var(--dim)}
+  .readout .v{color:#bfe7ff}
+  .pill{display:inline-block;font-family:var(--mono);font-size:12px;padding:3px 9px;border-radius:7px;border:1px solid var(--line);color:var(--muted);margin-right:6px}
+  .key{color:var(--ok);font-weight:700}
+  .note{color:var(--muted);font-size:14px;margin-top:14px;padding:12px 14px;background:rgba(52,211,153,.06);border:1px solid rgba(52,211,153,.25);border-radius:9px}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin-top:10px;justify-content:center}
+  .legend i{width:22px;height:3px;display:inline-block;vertical-align:middle;margin-right:6px;border-radius:2px}
+  footer{padding:40px 0;color:var(--dim);font-size:13px;text-align:center}
+  .big{font-size:20px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">交互可视化 · 拖动滑块亲手转一转</div>
+  <h1>RoPE:把<span class="grad">位置</span>转进向量里</h1>
+  <p class="lead">RoPE(Rotary Position Embedding,旋转位置编码)把 q/k 向量每两个数看成一根"指针",
+  按 token 的位置把它<b>转一个角度</b>。下面三个互动区,拖滑块就能看懂它在干什么、为什么有效。</p>
+</header>
+
+<!-- ============ 区 1:单根针 ============ -->
+<section>
+  <h2><span class="n">1</span>一对数 = 一根针,位置越大转得越多</h2>
+  <p class="sub">取向量最前面的两个数 <code>(v0, v1)</code>,画成一根从原点出发的针。
+  拖动「位置 pos」滑块:针会被转 <code>θ = pos × 频率</code> 度。<b class="key">注意针的长度始终不变,只是方向变。</b></p>
+  <div class="card row">
+    <div>
+      <canvas id="c1" width="680" height="680"></canvas>
+      <div class="legend">
+        <span><i style="background:var(--in)"></i>原始向量 (v0,v1)</span>
+        <span><i style="background:var(--q)"></i>旋转后 (位置戳)</span>
+      </div>
+    </div>
+    <div>
+      <div class="ctrl">
+        <label>token 位置 pos <b id="p1v">0</b></label>
+        <input type="range" id="p1" min="0" max="16" value="0" step="1">
+      </div>
+      <div class="ctrl">
+        <label>原始 v0 <b id="v0v">0.80</b></label>
+        <input type="range" id="v0" min="-1" max="1" value="0.8" step="0.05">
+      </div>
+      <div class="ctrl">
+        <label>原始 v1 <b id="v1v">0.60</b></label>
+        <input type="range" id="v1" min="-1" max="1" value="0.6" step="0.05">
+      </div>
+      <div class="readout">
+        <div><span class="lbl">旋转角度 θ = pos×freq =</span> <span class="v" id="theta1">0°</span></div>
+        <div><span class="lbl">原始针:</span> <span class="v" id="orig1">(0.80, 0.60)</span> 长度 <span class="v" id="len1">1.00</span></div>
+        <div><span class="lbl">旋转后:</span> <span class="v" id="rot1">(0.80, 0.60)</span> 长度 <span class="v" id="len1b">1.00</span></div>
+      </div>
+      <div class="note">长度没变 → RoPE 不改变向量"大小",只改"方向"。方向就编码了"我在第几个位置"。</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 区 2:多根针不同转速 ============ -->
+<section>
+  <h2><span class="n">2</span>288 个数 = 144 根针,转速不同</h2>
+  <p class="sub">向量被两两配对成很多根针,它们<b>转速不同</b>:靠前的针转得快(像秒针,管"近距离"),
+  靠后的转得慢(像时针,管"远距离")。拖 pos,看它们一起转——快的转好几圈,慢的才动一点点。</p>
+  <div class="card">
+    <canvas id="c2" width="1200" height="360"></canvas>
+    <div class="ctrl" style="max-width:520px;margin:16px auto 0">
+      <label>token 位置 pos <b id="p2v">0</b></label>
+      <input type="range" id="p2" min="0" max="32" value="0" step="1">
+    </div>
+    <div class="note">就像钟表用秒/分/时针同时表示秒、分、时,RoPE 用不同转速的针<b>同时编码近距离和远距离</b>的位置关系。</div>
+  </div>
+</section>
+
+<!-- ============ 区 3:相对位置的魔法 ============ -->
+<section>
+  <h2><span class="n">3</span>魔法:比较两个词时,只剩"位置差"</h2>
+  <p class="sub">把同一对数,分别盖上「词A 在 posA」和「词B 在 posB」的位置戳。注意力靠 <code>q·k</code> 比较,
+  而点积主要看<b>两根针的夹角</b>。拖动两个位置滑块——<b class="key">夹角永远等于 (posB − posA)×频率,只跟"相隔多远"有关,跟绝对位置无关!</b></p>
+  <div class="card row">
+    <div>
+      <canvas id="c3" width="680" height="680"></canvas>
+      <div class="legend">
+        <span><i style="background:var(--q)"></i>词A 的针 (posA)</span>
+        <span><i style="background:var(--k)"></i>词B 的针 (posB)</span>
+      </div>
+    </div>
+    <div>
+      <div class="ctrl">
+        <label>词A 位置 posA <b id="pAv">2</b></label>
+        <input type="range" id="pA" min="0" max="20" value="2" step="1">
+      </div>
+      <div class="ctrl">
+        <label>词B 位置 posB <b id="pBv">5</b></label>
+        <input type="range" id="pB" min="0" max="20" value="5" step="1">
+      </div>
+      <div class="readout">
+        <div><span class="lbl">posA 转角:</span> <span class="v" id="angA">—</span> &nbsp; <span class="lbl">posB 转角:</span> <span class="v" id="angB">—</span></div>
+        <div><span class="lbl">两针夹角 =</span> <span class="v big" id="diff">—</span></div>
+        <div><span class="lbl">位置差 (posB−posA) =</span> <span class="v" id="dpos">—</span></div>
+        <div><span class="lbl">q·k 点积 ∝ cos(夹角) =</span> <span class="v" id="dot">—</span></div>
+      </div>
+      <div class="note" id="magicNote">试试:把 A、B 一起往右拖(比如 A=0,B=3 → A=10,B=13),位置差不变 → <b>夹角和点积完全不变</b>。这就是 RoPE 给注意力带来"相对位置感"的原理。</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="n">★</span>三句话总结</h2>
+  <div class="card">
+    <p>1. <b>每两个数 = 一根针</b>;RoPE 按 token 位置把针<b>转一个角度</b>(位置越后转越多),长度不变。</p>
+    <p style="margin-top:8px">2. <b>转完比较两个词时,只剩"位置差"决定夹角</b> → 注意力自动知道两词相隔多远。</p>
+    <p style="margin-top:8px">3. <b>144 根针转速不同</b>(快针管近、慢针管远),像钟表的秒/分/时针配合。</p>
+  </div>
+</section>
+
+</div>
+<footer>RoPE 交互可视化 · 配合 ~/llama2.cu/run.cu 的 RoPe_rotation_kernel 理解 · 纯静态,可离线打开</footer>
+
+<script>
+const TAU = Math.PI*2;
+// 为了视觉效果,把"每格角度"放大(真实 freq 很小,高频针转太快看不清)
+// 单根针:用一个适中的 baseStep,让拖动可见
+function drawArrow(ctx, cx, cy, ang, len, color, width, label){
+  const x = cx + Math.cos(ang)*len, y = cy - Math.sin(ang)*len; // 屏幕y向下,取负
+  ctx.strokeStyle=color; ctx.fillStyle=color; ctx.lineWidth=width; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(x,y); ctx.stroke();
+  // 箭头
+  const ah=12+width; const a1=ang+Math.PI*0.85, a2=ang-Math.PI*0.85;
+  ctx.beginPath(); ctx.moveTo(x,y);
+  ctx.lineTo(x+Math.cos(a1)*ah, y-Math.sin(a1)*ah);
+  ctx.lineTo(x+Math.cos(a2)*ah, y-Math.sin(a2)*ah);
+  ctx.closePath(); ctx.fill();
+  if(label){ ctx.fillStyle=color; ctx.font='13px monospace'; ctx.fillText(label, x+8, y-6); }
+}
+function drawGrid(ctx,w,h,cx,cy,R){
+  ctx.clearRect(0,0,w,h);
+  // 圆
+  ctx.strokeStyle='#15233f'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,TAU); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx,cy,R*0.66,0,TAU); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx,cy,R*0.33,0,TAU); ctx.stroke();
+  // 轴
+  ctx.strokeStyle='#22324f';
+  ctx.beginPath(); ctx.moveTo(cx-R-10,cy); ctx.lineTo(cx+R+10,cy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx,cy-R-10); ctx.lineTo(cx,cy+R+10); ctx.stroke();
+}
+function arcBetween(ctx,cx,cy,a0,a1,r,color){
+  ctx.strokeStyle=color; ctx.lineWidth=3; ctx.globalAlpha=.5;
+  ctx.beginPath();
+  // canvas arc 用顺时针,角度取负对齐我们的数学角
+  ctx.arc(cx,cy,r,-Math.max(a0,a1),-Math.min(a0,a1));
+  ctx.stroke(); ctx.globalAlpha=1;
+}
+
+// ---------- 区1 ----------
+const c1=document.getElementById('c1'), x1=c1.getContext('2d');
+const STEP1 = 20*Math.PI/180; // 每个位置转 20°,便于观察
+function render1(){
+  const pos=+p1.value, v0=+v0.value, v1=+v1.value;
+  const theta = pos*STEP1;
+  p1v.textContent=pos; v0v.textContent=v0.toFixed(2); v1v.textContent=v1.toFixed(2);
+  const W=c1.width,H=c1.height,cx=W/2,cy=H/2,R=W*0.4;
+  drawGrid(x1,W,H,cx,cy,R);
+  const baseAng=Math.atan2(v1,v0), baseLen=Math.hypot(v0,v1);
+  const L=baseLen*R*0.9;
+  // 原始(灰)
+  drawArrow(x1,cx,cy,baseAng,L,'#5c6f92',4,'原始');
+  // 旋转后(蓝)
+  const rotAng=baseAng+theta;
+  drawArrow(x1,cx,cy,rotAng,L,'#38bdf8',6,'转后');
+  // 夹角弧
+  if(pos>0) arcBetween(x1,cx,cy,baseAng,rotAng,R*0.5,'#a855f7');
+  // 数值
+  const nv0=v0*Math.cos(theta)-v1*Math.sin(theta);
+  const nv1=v0*Math.sin(theta)+v1*Math.cos(theta);
+  theta1.textContent=(pos*20)+'°';
+  orig1.textContent=`(${v0.toFixed(2)}, ${v1.toFixed(2)})`;
+  rot1.textContent=`(${nv0.toFixed(2)}, ${nv1.toFixed(2)})`;
+  len1.textContent=baseLen.toFixed(2);
+  len1b.textContent=Math.hypot(nv0,nv1).toFixed(2);
+}
+[p1,v0,v1].forEach(e=>e.addEventListener('input',render1));
+
+// ---------- 区2:多根针 ----------
+const c2=document.getElementById('c2'), x2=c2.getContext('2d');
+const NEEDLES=6;
+function render2(){
+  const pos=+p2.value; p2v.textContent=pos;
+  const W=c2.width,H=c2.height; x2.clearRect(0,0,W,H);
+  const r=H*0.36, gap=W/NEEDLES, cy=H/2;
+  for(let i=0;i<NEEDLES;i++){
+    const cx=gap*(i+0.5);
+    // 频率:第0根最快,往后指数减慢(模拟 1/10000^(i/d))
+    const freq=Math.pow(0.45, i); // 0.45^i,递减
+    const stepDeg=70*freq;        // 第0根每位置70°,越往后越小
+    const theta=pos*stepDeg*Math.PI/180;
+    // 圆
+    x2.strokeStyle='#15233f'; x2.lineWidth=1;
+    x2.beginPath(); x2.arc(cx,cy,r,0,TAU); x2.stroke();
+    // 针(色相随 i 变化)
+    const hue=200+i*26;
+    drawArrow(x2,cx,cy,theta,r*0.85,`hsl(${hue},80%,65%)`,4);
+    // 标注
+    x2.fillStyle='#8497b8'; x2.font='12px monospace'; x2.textAlign='center';
+    x2.fillText(`针${i}`, cx, cy+r+22);
+    x2.fillText(i===0?'最快':(i===NEEDLES-1?'最慢':''), cx, cy+r+38);
+    x2.fillText(`${(stepDeg).toFixed(0)}°/格`, cx, cy-r-12);
+  }
+  x2.textAlign='left';
+}
+p2.addEventListener('input',render2);
+
+// ---------- 区3:两个词 ----------
+const c3=document.getElementById('c3'), x3=c3.getContext('2d');
+const STEP3=18*Math.PI/180;
+function render3(){
+  const pA=+pA_.value, pB=+pB_.value; pAv.textContent=pA; pBv.textContent=pB;
+  const W=c3.width,H=c3.height,cx=W/2,cy=H/2,R=W*0.4;
+  drawGrid(x3,W,H,cx,cy,R);
+  // 同一对原始数 (1,0) 作基准,清楚看角度
+  const base=0;
+  const angA=base+pA*STEP3, angB=base+pB*STEP3;
+  arcBetween(x3,cx,cy,angA,angB,R*0.55,'#a855f7');
+  drawArrow(x3,cx,cy,angA,R*0.85,'#38bdf8',6,'A');
+  drawArrow(x3,cx,cy,angB,R*0.85,'#f472b6',6,'B');
+  const dDeg=Math.abs(pB-pA)*18;
+  angA_el.textContent=(pA*18)+'°'; angB_el.textContent=(pB*18)+'°';
+  diff.textContent=dDeg+'°';
+  dpos.textContent=(pB-pA);
+  dot.textContent=Math.cos(Math.abs(pB-pA)*STEP3).toFixed(3);
+}
+const pA_=document.getElementById('pA'), pB_=document.getElementById('pB');
+const angA_el=document.getElementById('angA'), angB_el=document.getElementById('angB');
+pA_.addEventListener('input',render3); pB_.addEventListener('input',render3);
+
+render1(); render2(); render3();
+</script>
+</body>
+</html>
