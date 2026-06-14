@@ -669,22 +669,53 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
 }
 #endif
 
-// Additional neural net blocks (brought out from transformer function)
+// ============================================================================
+// RoPE(Rotary Position Embedding,旋转位置编码)
+//
+// 在做什么:把 token 的"位置"信息【旋转】进 q、k 向量。注意力靠 q·k 点积比较,但点积
+//   不看顺序;RoPE 把向量每两个数看成一根"针",按位置把针转一个角度——位置就编码进去了。
+//   妙处:转完后两个词的 q·k 只取决于它们的【位置差】→ 注意力天然获得"相对距离"感。
+//   ★ 长度不变、只转方向;无矩阵乘、无可学习参数(freq 由公式固定算出)。
+//
+// 输入: pos(当前token位置), sq=q[288], sk=k[288], kv_dim=288, head_size=48
+// 输出: 原地旋转 q、k(长度不变,方向带上位置 pos)
+// 启动: <<<1, dim/2=144>>>  —— 144 个线程,每线程转一对 (v[i], v[i+1]),互不干扰
+//
+//   q[288] 两两配对 = 144 对,按头切分(每头48维=24对):
+//    线程: t0 t1 ...t23 │ t24..t47 │ ... │ t120..t143
+//          └─ 头0(24对)─┘└─ 头1 ──┘     └── 头5 ──┘
+//
+//   每个线程做 5 步:
+//    ① i=t*2; head_dim=i%head_size                  定位这对、算频率编号
+//    ② freq = 1/10000^(head_dim/head_size)           转速:head_dim小→freq≈1(快,管近)
+//                                                          head_dim大→freq≈0.0002(慢,管远)
+//    ③ θ = pos * freq                                角度:pos越大转越多(位置注入处)
+//    ④ cosθ, sinθ
+//    ⑤ 2D 旋转,原地写回(对 q;若 i<kv_dim 也对 k):
+//         v1 ^   ╱原针(v0,v1)                 vec[i]   = v0·cosθ − v1·sinθ  (新v0)
+//            │  ╱  ╲ 转θ后(长度不变)          vec[i+1] = v0·sinθ + v1·cosθ  (新v1)
+//            └────→ v0
+//
+//   频率谱(一个头内24对,高频→低频,像钟表 秒针→时针 同时编码近/远距离):
+//     freq 1.0┤█▇▆▅▄▃▂▁▁▁ ▁  ▁   ▁    ▁
+//          0.0┼──────────────────────────► 对编号(0→23)
+//             近距离敏感 ←────→ 远距离敏感
+// ============================================================================
 #ifdef USE_CUDA
 __global__ void RoPe_rotation_kernel(int pos, float *sq, float *sk, int kv_dim, int head_size) {
-    int i = threadIdx.x * 2;
-    int head_dim = i % head_size;
-    float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-    float val = pos * freq;
-    float fcr = cosf(val);
-    float fci = sinf(val);
-    int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+    int i = threadIdx.x * 2;        // ① 这对的下标 (i, i+1);线程 t 管第 t 对
+    int head_dim = i % head_size;   //    在头内排第几(决定频率;每头循环一遍)
+    float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);  // ② 转速
+    float val = pos * freq;         // ③ 旋转角度 θ = 位置 × 频率
+    float fcr = cosf(val);          // ④ cosθ
+    float fci = sinf(val);          //    sinθ
+    int rotn = i < kv_dim ? 2 : 1;  // 转几个:2=q和k都转;1=只转q(GQA时靠后的对k已无对应)
     for (int v = 0; v < rotn; v++) {
         float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
         float v0 = vec[i];
         float v1 = vec[i+1];
-        vec[i]   = v0 * fcr - v1 * fci;
-        vec[i+1] = v0 * fci + v1 * fcr;
+        vec[i]   = v0 * fcr - v1 * fci;   // ⑤ 2D 旋转:新 v0
+        vec[i+1] = v0 * fci + v1 * fcr;   //            新 v1(长度不变)
     }
 }
 void RoPe_rotation(int pos, RunState* s, int dim, int kv_dim, int head_size) {
