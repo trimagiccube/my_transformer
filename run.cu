@@ -741,6 +741,47 @@ void RoPe_rotation(int pos, RunState* s, int dim, int kv_dim, int head_size) { /
 }
 #endif
 
+// ============================================================================
+// 多头自注意力(Multi-Head Self-Attention)—— forward 第 4 步,Transformer 的核心
+//
+// 【目的】让"当前 token"回看自己和所有历史 token,按相关度从它们身上提取信息,
+//         得到一个"融合了上下文"的新表示。这是模型理解上下文、抓长距离依赖的关键。
+//
+// 【输入】
+//   pos          : 当前 token 的位置(只能看 0..pos,看不到未来 = 因果性)
+//   sq = q[288]  : 当前 token 的 query(已 RoPE,带位置信息)
+//   key_cache    : 历史所有 token 的 K(KV Cache 里读,不重算)
+//   value_cache  : 历史所有 token 的 V
+//   kv_mul/head_size/loff: 头映射、每头维度、本层在 cache 的偏移
+//
+// 【输出 / 结果存哪】
+//   写入 sxb(即 RunState.xb)[288]:当前 token 看完上下文后的新表示。
+//   随后被第 5 步 Wo 投影,再残差加回主干 x。
+//
+// 【做什么计算】每个头独立做 3 步(q 和历史 k/v 都按头切成 48 维):
+//
+//   当前 q(本头48维)
+//        │ ① 打分:和每个历史 k 点积,/√head_size 缩放      ← 用 KV Cache 的 K
+//        ▼
+//   att=[q·k0, q·k1, ..., q·k_pos]/√48   "对每个历史的关注分"
+//        │ ② softmax → 权重(和为1)
+//        ▼
+//   w  =[0.5, 0.05, 0.3, ...]            "该把多少注意力分给谁"
+//        │ ③ 加权求和:Σ w[t]·v[t]                          ← 用 KV Cache 的 V
+//        ▼
+//   xb(本头48维)= 0.5·v0 + 0.05·v1 + 0.3·v2 + ...  (按相关度混合历史内容)
+//
+//   6 个头各做一遍 → 拼成 xb[288]
+//
+// 【并行】<<<n_heads=6, 1024>>>:每个 block 算一个头(blockIdx.x=h),块内 1024 线程
+//   协作:第①步线程分摊 0..pos 个历史位置打分;②块内 softmax;③线程分摊输出 48 维。
+//
+// 【要点】
+//   • 只看 0..pos(循环上界 t<=pos)= 因果/自回归,看不到未来,无需显式 mask。
+//   • RoPE 在第①步 q·k 生效 → 点积自动含"两 token 相隔多远"的位置信息。
+//   • 历史 k/v 全从 KV Cache 读(不重算)→ 这就是 KV Cache 省算力的地方。
+//   • 6 个头关注"角度"不同(语法/语义/距离…),最后拼起来。
+// ============================================================================
 #ifdef USE_CUDA
 // TODO refactor vs C code
 // 每个 block 负责一个 Q 头(blockIdx.x = h),块内 1024 线程协作:打分→softmax→加权求V
@@ -750,6 +791,7 @@ __global__ void multi_head_attention_kernel(int pos, int seq_len, float *sq, flo
     float* q = sq + h * head_size;
     // attention scores for this head
     float* att = satt + h * seq_len;
+    // —— ① 打分:线程分摊 0..pos 个历史位置,各算 q·k 存入 att[t] ——
     // iterate over all timesteps, including the current one
     // In CUDA, each thread does a small portion of the calc
     for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
@@ -774,10 +816,12 @@ __global__ void multi_head_attention_kernel(int pos, int seq_len, float *sq, flo
     // above was this threads portion of the iteration.  wait for all threads to finish
     __syncthreads();
 
+    // —— ② softmax:把分数变成权重(和为1),att[0..pos] 原地变成注意力权重 ——
     // softmax the scores to get attention weights, from 0..pos inclusively
     softmax_gpu(att, pos + 1);
     __syncthreads();
 
+    // —— ③ 加权求和:线程分摊输出 48 维,每维 = Σ att[t]·v[t],写回 xb(本头) ——
     // weighted sum of the values, store back into xb
     // NOTE: by swapping the order of the for loops (vs. C) a simpler
     // version of the code accomplishes the same task and fits more
@@ -1001,7 +1045,9 @@ float* forward(Transformer* transformer, int token, int pos) {
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         RoPe_rotation(pos, s, dim, kv_dim, head_size);
 
-        // multihead attention. iterate over all heads
+        // 第 4 步:多头自注意力。输入当前 q(已RoPE) + KV Cache 里 0..pos 的历史 k/v,
+        // 每头做 打分→softmax→加权求V,结果写回 s->xb[288](= 看完上下文的新表示)。
+        // 详见 multi_head_attention_kernel 注释。
         multi_head_attention(pos, p, s, kv_dim, kv_mul, head_size, loff);
 
         // final matmul to get the output of the attention
