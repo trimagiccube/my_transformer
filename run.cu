@@ -752,7 +752,17 @@ void RoPe_rotation(int pos, RunState* s, int dim, int kv_dim, int head_size) { /
 //   sq = q[288]  : 当前 token 的 query(已 RoPE,带位置信息)
 //   key_cache    : 历史所有 token 的 K(KV Cache 里读,不重算)
 //   value_cache  : 历史所有 token 的 V
-//   kv_mul/head_size/loff: 头映射、每头维度、本层在 cache 的偏移
+//   head_size : 每个头的维度 = dim/n_heads = 48。把 288 切成 6 头各 48 维,点积在48维内算。
+//   kv_mul    : 几个 Q 头共享一组 K/V = n_heads/n_kv_heads。本模型 6/6=1(MHA,各读各的);
+//               GQA 时 >1,如 kv_mul=2 → Q0,Q1 共用 KV0。映射:第 h 个Q头读第 (h/kv_mul) 个KV头。
+//   loff      : 本层在 KV Cache 的起始偏移 = l*seq_len*kv_dim,用来定位"第几层"。
+//
+//   这三个 + t*kv_dim 在 KV Cache 大数组里【三级定位】一个 K/V 向量:
+//     k = key_cache + loff + t*kv_dim + (h/kv_mul)*head_size
+//                      │        │              │
+//                   定位层l   定位第t个token  定位第h头(切48维)
+//     ┌──── 层0 ────┬─ 层1 ─┬...┐   每层内:[pos0][pos1]...   每个pos内:[头0|头1|...|头5]
+//     └─ +loff 跳到第l层 ──────┘    └ +t*kv_dim 跳到第t个 ┘   └ +(h/kv_mul)*48 跳到第h头 ┘
 //
 // 【输出 / 结果存哪】
 //   写入 sxb(即 RunState.xb)[288]:当前 token 看完上下文后的新表示。
