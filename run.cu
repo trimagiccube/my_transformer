@@ -802,12 +802,32 @@ void RoPe_rotation(int pos, RunState* s, int dim, int kv_dim, int head_size) { /
 // ============================================================================
 #ifdef USE_CUDA
 // TODO refactor vs C code
-// 每个 block 负责一个 Q 头(blockIdx.x = h),块内 1024 线程协作:打分→softmax→加权求V
+// ---- kernel 参数逐个含义 -----------------------------------------------------
+//   pos         : 当前 token 位置;本次只对历史 0..pos 做注意力(因果)
+//   seq_len     : 序列最大长度(256),是 att / KV Cache 的行跨距
+//   sq          : 当前 token 的 query,[n_heads*head_size]=288,已 RoPE
+//   satt        : 注意力分数缓冲,[n_heads, seq_len];satt + h*seq_len = 第h头那一行
+//   sxb         : 输出缓冲(=RunState.xb),[288];每头把结果写进自己那 48 维
+//   key_cache   : 所有历史 token 的 K,布局 [layer][seq_len][kv_dim]
+//   value_cache : 所有历史 token 的 V,同布局
+//   kv_dim      : 一个位置的 K/V 总维度(288;= head_size*n_kv_heads),也是位置间步长
+//   kv_mul      : 几个 Q 头共享一组 KV(=n_heads/n_kv_heads);本模型=1(MHA)
+//   head_size   : 每个头的维度(48)
+//   loff        : 本层在 KV Cache 的起始偏移(= l*seq_len*kv_dim),定位"第几层"
+//
+// ---- 每个 block 处理什么任务 -------------------------------------------------
+//   grid = n_heads(6),即【一个 block 负责一个注意力头 h = blockIdx.x】。
+//   该 block 内 1024 个线程协作,完成"第 h 头"的全部注意力:
+//     ① 用本头的 q(48维)和历史每个 token 的本头 k 打分 → 填 att[0..pos]
+//     ② 对 att[0..pos] 做 softmax 得权重
+//     ③ 按权重对历史本头的 v 加权求和 → 写进 sxb 第 h 头那 48 维
+//   6 个 block 并行 = 6 个头同时算,互不干扰;拼起来就是完整的 xb[288]。
+// -----------------------------------------------------------------------------
 __global__ void multi_head_attention_kernel(int pos, int seq_len, float *sq, float *satt, float *sxb, float *key_cache, float *value_cache, int kv_dim, int kv_mul, int head_size, int loff) {
-    int h = blockIdx.x;             // 当前 Q 头编号 (0 .. n_heads-1)
-    // get the query vector for this head
+    int h = blockIdx.x;             // 当前 Q 头编号 (0 .. n_heads-1);本 block 只管这一个头
+    // 取本头的 query:q 向量第 h 头那 48 维(从 h*head_size 开始)
     float* q = sq + h * head_size;
-    // attention scores for this head
+    // 本头的分数行:satt 是 [n_heads, seq_len],第 h 头用第 h 行(h*seq_len 起)
     float* att = satt + h * seq_len;
     // —— ① 打分:线程分摊 0..pos 个历史位置,各算 q·k 存入 att[t] ——
     // iterate over all timesteps, including the current one
@@ -844,7 +864,7 @@ __global__ void multi_head_attention_kernel(int pos, int seq_len, float *sq, flo
     // NOTE: by swapping the order of the for loops (vs. C) a simpler
     // version of the code accomplishes the same task and fits more
     // naturally with the CUDA way of subdividing the problem.
-    float* xb = sxb + h * head_size;
+    float* xb = sxb + h * head_size;   // 本头输出写到 xb 的第 h 头那 48 维(h*head_size 起)
     for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
         float val = 0.0f;
         for (int t = 0; t <= pos; t++) {
