@@ -548,11 +548,40 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
 #endif
 
 #ifdef USE_CUDA
+// ============================================================================
+// softmax_gpu:把一组分数变成"和为1的权重"(块内 1024 线程协作,原地覆盖 x[0..size))
+//
+// 【目的】注意力打分 att=[1.2, 3.5, 0.8, 2.0] 是无范围的原始分,softmax 把它压成
+//   概率分布 [0.08, 0.65, 0.05, 0.22](全正、和=1)→ 当作"该给谁多少注意力"的权重。
+//
+// 【公式】softmax(x)[i] = e^(x[i]) / Σ e^(x[j])
+//   但直接 e^x 在 x 大时会溢出,所以先减去最大值(数值稳定,结果不变):
+//             = e^(x[i] - max) / Σ e^(x[j] - max)
+//
+// 【三段,每段都是"线程分摊 + CUB 块内归约"】(size = pos+1 个分数):
+//
+//   段1 求最大值 max(为了数值稳定):
+//       线程各扫自己负责的元素求局部max → cub::BlockReduce(Max) 合成全局 max
+//       x=[1.2, 3.5, 0.8, 2.0] ───► max = 3.5
+//
+//   段2 减max、取指数、求和:
+//       x[i] = exp(x[i]-max);  各线程累加局部和 → cub::BlockReduce(Sum) 合成总和
+//       exp: [e^-2.3, e^0, e^-2.7, e^-1.5] = [0.10, 1.0, 0.067, 0.22]  → sum=1.39
+//
+//   段3 归一化:每个元素 ÷ sum
+//       [0.10,1.0,0.067,0.22]/1.39 = [0.072, 0.72, 0.048, 0.16]  ← 和=1,即权重
+//
+//   每段之间靠 __syncthreads + shared_val 把归约结果(max/sum)广播给所有线程。
+//
+// 【线程怎么分摊】网格跨步:线程 tid 负责 x[tid], x[tid+1024], ...(本例 size 小,
+//   基本是一线程一个元素;att 最长 256<1024,所以大多一人一个,多余线程不参与)。
+// ============================================================================
 __device__ void softmax_gpu(float* __restrict__ x, int size) {
     int tid = threadIdx.x;
-    int step = blockDim.x;
+    int step = blockDim.x;          // 步长=线程数,做网格跨步
 
-    // find max value (for numerical stability)
+    // —— 段1:求最大值 max(数值稳定用)——
+    // 每个线程先求自己负责那些元素的局部最大
     float max_val = tid < size ? x[tid] : 0;
     for (int i = tid + step; i < size; i += step) {
         if (x[i] > max_val) {
@@ -562,27 +591,27 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
     using BlockReduce = cub::BlockReduce<float, num_threads_lrg>;
     __shared__ typename BlockReduce::TempStorage temp;
     __shared__ float shared_val;
-    max_val = BlockReduce(temp).Reduce(max_val, cub::Max());
-    if (threadIdx.x == 0) {
+    max_val = BlockReduce(temp).Reduce(max_val, cub::Max());  // CUB 归约:1024个局部max → 1个全局max
+    if (threadIdx.x == 0) {        // 0号线程拿到结果,放共享内存广播
         shared_val = max_val;
     }
     __syncthreads();
-    max_val = shared_val;
+    max_val = shared_val;          // 所有线程拿到同一个 max
 
-    // exp and sum
+    // —— 段2:每个元素减max、取exp,同时累加得到总和 sum ——
     float sum = 0.0f;
     for (int i = tid; i < size; i += step) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
+        x[i] = expf(x[i] - max_val);   // 原地:分数 → exp 值
+        sum += x[i];                    // 累加局部和
     }
-    sum = BlockReduce(temp).Sum(sum);
+    sum = BlockReduce(temp).Sum(sum);   // CUB 归约:1024个局部和 → 总和
     if (threadIdx.x == 0) {
         shared_val = sum;
     }
     __syncthreads();
-    sum = shared_val;
+    sum = shared_val;              // 所有线程拿到同一个 sum
 
-    // normalize
+    // —— 段3:归一化,每个 exp 值 ÷ sum → 得到权重(和为1)——
     for (int i = tid; i < size; i += step) {
         x[i] /= sum;
     }
