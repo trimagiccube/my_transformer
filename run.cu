@@ -830,8 +830,9 @@ __global__ void multi_head_attention_kernel(int pos, int seq_len, float *sq, flo
     // 本头的分数行:satt 是 [n_heads, seq_len],第 h 头用第 h 行(h*seq_len 起)
     float* att = satt + h * seq_len;
     // —— ① 打分:线程分摊 0..pos 个历史位置,各算 q·k 存入 att[t] ——
-    // iterate over all timesteps, including the current one
-    // In CUDA, each thread does a small portion of the calc
+    // 【外层循环】迭代"历史 token 的位置 t"(0..pos):每次迭代算"当前token 对 第t个历史"
+    //   的一个注意力分数。由 1024 线程分摊(pos<256<1024 时基本=每线程管一个位置 t,
+    //   多余线程不进循环)。t<=pos 这个上界 = 只看历史、看不到未来(因果性)。
     for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
         // ---- GQA/MHA 的头映射就在这里:第 h 个 Q 头去读第 (h/kv_mul) 个 KV 头 ----
         //   MHA(本模型 kv_mul=1):h/1 = h   → Q头h 读 KV头h(1:1,每Q独享一组KV)
@@ -843,12 +844,13 @@ __global__ void multi_head_attention_kernel(int pos, int seq_len, float *sq, flo
         //   (h/kv_mul) 把 Q 头索引折算成它该读的 KV 头索引;乘 head_size 跳到该 KV 头起点
         float* k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
         // calculate the attention score as the dot product of q and k
+        // 【内层循环】q·k 点积:在本头的 48 维里逐元素乘加,得到一个分数标量
         float score = 0.0f;
-        for (int i = 0; i < head_size; i++) {
+        for (int i = 0; i < head_size; i++) {   // head_size=48 次乘加
             score += q[i] * k[i];
         }
-        score /= sqrtf(head_size);
-        // save the score to the attention buffer
+        score /= sqrtf(head_size);   // ÷√48 缩放:防维度大时点积过大、softmax 饱和
+        // 存进本头分数行的第 t 个位置
         att[t] = score;
     }
     // above was this threads portion of the iteration.  wait for all threads to finish
