@@ -905,15 +905,21 @@ __global__ void multi_head_attention_kernel(int pos, int seq_len, float *sq, flo
     softmax_gpu(att, pos + 1);
     __syncthreads();
 
-    // —— ③ 加权求和:线程分摊输出 48 维,每维 = Σ att[t]·v[t],写回 xb(本头) ——
+    // —— ③ 加权求和:用权重把历史的 V 混合,xb[i] = Σ_t att[t]·v[t][i],写回 xb(本头) ——
+    // 注意循环变量变了:① 打分时外层迭代"历史位置 t";这里外层迭代"输出维度 i(0..47)",
+    //   即【一个线程负责输出的一维】,内层再遍历所有历史 token 累加。
+    // ★ 线程利用率:本步 i<head_size=48,所以 1024 线程里只有【前 48 个】进循环干活,
+    //   其余 976 个空转。(各步有效线程数不同:① 打分 ≤ pos+1(最多256);③ 固定 48。
+    //    block 仍开 1024 是因为 cub::BlockReduce 要求 blockDim 固定、且要覆盖最大情况。
+    //    线程利用率低是朴素实现的典型特征,工业级 flash-attn 会精心排满线程。)
     // weighted sum of the values, store back into xb
     // NOTE: by swapping the order of the for loops (vs. C) a simpler
     // version of the code accomplishes the same task and fits more
     // naturally with the CUDA way of subdividing the problem.
     float* xb = sxb + h * head_size;   // 本头输出写到 xb 的第 h 头那 48 维(h*head_size 起)
-    for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
+    for (int i = threadIdx.x; i < head_size; i += blockDim.x) {   // 外层:输出维度 i;仅 i<48 干活
         float val = 0.0f;
-        for (int t = 0; t <= pos; t++) {
+        for (int t = 0; t <= pos; t++) {   // 内层:遍历所有历史 token,累加 att[t]·v[t][i]
             // 同理:第 h 个 Q 头读第 (h/kv_mul) 个 KV 头的 V(MHA 时即第 h 个)
             float* v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
             // get the attention weight for this timestep
