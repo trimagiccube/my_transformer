@@ -1165,9 +1165,23 @@ float* forward(Transformer* transformer, int token, int pos) {
         //   dim (=288)          = d    : 输出维度(288→288,不变维)
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);   // xb → xb2(融合多头)
 
-        // 第 6 步:残差连接。把注意力子块的结果 xb2 加回主干隐藏状态 x(用原始 x)。
-        //   x = x + xb2 → 注意力子块结束,x 带上了"上下文信息",继续进 FFN 子块。
-        accum(x, s->xb2, dim);                                 // x += xb2
+        // ===== 第 6 步:残差连接 ========================================================
+        // 【在干什么】算完注意力后,不把 x 替换成新结果,而是把注意力结果 xb2【加回】原来的 x:
+        //     x = x + xb2
+        //   注意力始终没改 x(中间结果都写在 xb/xb2),这里才用【原始 x】相加。
+        //
+        //     x ─┬───────────────► (一条捷径,x 原样保留)
+        //        │                          │
+        //        └─►注意力计算→xb2          ▼
+        //                        x = x + xb2 (把结果加回 x)
+        //
+        // 【输入】原始 x[288] + 注意力结果 xb2[288]  【输出】新的 x = x+xb2(原地写回)
+        // 【为什么加回去而不是替换】
+        //   ① 给信息/梯度一条直达高速路 → 很深的网络也能训练(最重要;否则梯度逐层消失)。
+        //   ② 每层只需学"在 x 上改动一点"(增量),不必"重造"整个表示,任务更简单。
+        //   ③ 原始信息不丢:就算这次计算没用(结果≈0),x 也原样传下去。
+        // 这条一路被加着更新、贯穿所有层的 x,就是"残差流"。
+        accum(x, s->xb2, dim);                                 // x = x + xb2
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
@@ -1183,8 +1197,9 @@ float* forward(Transformer* transformer, int token, int pos) {
         // final matmul to get the output of the ffn
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
-        // residual connection
-        accum(x, s->xb, dim);
+        // 残差连接(同第6步):把 FFN 结果加回原始 x。x = x + FFN输出。
+        //   一层里共两次残差:注意力后一次、FFN 后一次。x 一路被加着精炼 → 进下一层。
+        accum(x, s->xb, dim);   // x = x + FFN结果
     }
 
     // final rmsnorm
