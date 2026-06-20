@@ -1144,13 +1144,17 @@ float* forward(Transformer* transformer, int token, int pos) {
         // 第 4 步:多头自注意力。输入当前 q(已RoPE) + KV Cache 里 0..pos 的历史 k/v,
         // 每头做 打分→softmax→加权求V,结果写回 s->xb[288](= 看完上下文的新表示)。
         // 详见 multi_head_attention_kernel 注释。
+        //   注意力的输出 = s->xb[288](6个头各48维拼成),作为下面两步的输入。
         multi_head_attention(pos, p, s, kv_dim, kv_mul, head_size, loff);
 
-        // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        // 第 5 步:Wo 输出投影。把注意力输出 xb(多头拼接)再过一个 288×288 线性层,
+        //   让 6 个头的信息【交叉融合】并变回主干空间 → 结果存 xb2[288]。
+        //   (输出每维都加权混合了全部288个输入=所有头,这就是"融合多头")
+        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);   // xb → xb2
 
-        // residual connection back into x
-        accum(x, s->xb2, dim);
+        // 第 6 步:残差连接。把注意力子块的结果 xb2 加回主干隐藏状态 x(用原始 x)。
+        //   x = x + xb2 → 注意力子块结束,x 带上了"上下文信息",继续进 FFN 子块。
+        accum(x, s->xb2, dim);                                 // x += xb2
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
