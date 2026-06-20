@@ -901,6 +901,9 @@ __global__ void multi_head_attention_kernel(int pos, int seq_len, float *sq, flo
     __syncthreads();
 
     // —— ② softmax:把分数变成权重(和为1),att[0..pos] 原地变成注意力权重 ——
+    // 注意:att = satt + h*seq_len,所以这里只对【当前 block 负责的第 h 个 head】那一行做
+    //   softmax(每个 head 的权重各自和为1,本就按头独立)。6 个 head 由 6 个 block 并行各做各的;
+    //   head 内部由本 block 的 1024 线程协作完成(见 softmax_gpu 的三段归约)。
     // softmax the scores to get attention weights, from 0..pos inclusively
     softmax_gpu(att, pos + 1);
     __syncthreads();
