@@ -922,14 +922,17 @@ __global__ void multi_head_attention_kernel(int pos, int seq_len, float *sq, flo
     float* xb = sxb + h * head_size;   // 本头输出写到 xb 的第 h 头那 48 维(h*head_size 起)
     for (int i = threadIdx.x; i < head_size; i += blockDim.x) {   // 外层:输出维度 i;仅 i<48 干活
         float val = 0.0f;
+        // 本步用到两类数据:
+        //   v   ← 外部输入 value_cache(第t个历史的V,本头48维)
+        //   att ← 【本kernel内部结果】:第②步 softmax 算出的权重(原地存在 satt,
+        //          经①打分→②归一化得来;两次 __syncthreads 保证这里读到的是成品权重)
         for (int t = 0; t <= pos; t++) {   // 内层:遍历所有历史 token,累加 att[t]·v[t][i]
             // 同理:第 h 个 Q 头读第 (h/kv_mul) 个 KV 头的 V(MHA 时即第 h 个)
             float* v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-            // get the attention weight for this timestep
-            float a = att[t];
-            val += a * v[i];
+            float a = att[t];        // 第②步 softmax 的权重(注意:已不是原始分数)
+            val += a * v[i];         // 权重 × value 累加
         }
-        xb[i] = val;
+        xb[i] = val;   // 写回:本头输出第 i 维(6个头各填48维 → 拼成 xb[288])
     }
 }
 void multi_head_attention(int pos, Config* p, RunState* s, int kv_dim, int kv_mul, int head_size, int loff) {
