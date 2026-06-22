@@ -1016,6 +1016,18 @@ __global__ void f_silu_elementwise_mul_w3_kernel(float *shb, float *shb2, int hi
         shb[i] = val;                       // 原地写回 hb(结果给第10步 W2 降维)
     }
 }
+// host 端启动函数:本身不算数,只负责【线程编排】把上面的 kernel 发射到 GPU。
+//   <<< grid, block >>> = <<< divUp(hidden_dim,256), 256 >>>
+//     block = 256(每块线程数,num_threads_med)
+//     grid  = ⌈768/256⌉ = 3(按数据量切分:要够覆盖 768 个元素)
+//     总线程 = 3×256 = 768,正好一个线程算一个元素(逐元素型,位置间独立、无需通信)
+//
+//     block0(线程0..255)  block1(256..511)  block2(512..767)
+//     处理 hb[0..255]      hb[256..511]       hb[512..767]
+//     kernel 里 i = blockIdx.x*256 + threadIdx.x → 全局位置;if(i<hidden_dim) 防越界
+//
+//   divUp 向上取整保证线程数≥元素数(不漏算);多开的线程被 if 挡掉(不越界)。
+//   输入 s->hb(门控)、s->hb2(数据);输出原地写回 hb=silu(hb)·hb2 → 交第10步 W2 降维。
 void f_silu_elementwise_mul_w3(RunState *s, int hidden_dim) {
     f_silu_elementwise_mul_w3_kernel<<<divUp(hidden_dim, num_threads_med), num_threads_med>>>(s->hb, s->hb2, hidden_dim);
 }
