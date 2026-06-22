@@ -1336,8 +1336,16 @@ float* forward(Transformer* transformer, int token, int pos) {
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // ===== lm_head(分类头,代码里叫 wcls)=========================================
+    // 【lm_head 怎么理解】lm = Language Model(语言模型),head = 深度学习术语"输出头"——
+    //   即接在主干(6层decoder)后、产出某个具体任务结果的【最后一层】。比喻:主干=身体负责
+    //   "理解",head=输出头负责"出答案"。同一主干换不同 head 可做不同任务:
+    //     lm_head→预测下一个词 ; classification head→分类 ; regression head→打分。
+    //   本 demo 的任务是"预测下一个词"(=从词表32000个里选一个=32000类分类),所以这个"头"
+    //   的权重在代码里叫 wcls(weight for classifier)。lm_head / wcls / 分类头 = 同一个东西。
+    //   (对称:输入端 token_embedding 是"查表头" id→向量;输出端 lm_head 是"输出头"向量→词)
+    //
     // 【在做什么】forward 的最后一次、也是最大的一次矩阵乘:把 x[288] 投影到词表维度,
-    //   得到每个词的"分数"。lm_head = Language Model Head(语言模型输出头)。
+    //   得到每个词的"分数"。
     //   x[288] ──wcls[32000×288]──► logits[32000]   词表每个词一个分数,越高=越可能是下一个词
     // 【输入】x[288](final norm后) 【权重】wcls(32000×288) 【输出】logits[32000]
     // 【weight tying】本模型 wcls 与输入端 token_embedding 共享同一块权重("词→向量"与
