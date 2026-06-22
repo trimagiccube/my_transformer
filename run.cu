@@ -981,16 +981,39 @@ void multi_head_attention(int pos, Config* p, RunState* s, int kv_dim, int kv_mu
 }
 #endif
 
+// ============================================================================
+// SwiGLU 激活(FFN 第 9 步):输出 = silu(hb) ⊙ hb2(逐元素相乘,原地写回 hb)
+//
+// 【两路的角色】(都是 768 维,来自第8步 W1/W3 升维)
+//   hb (W1路) = 门控路 gate:过 SiLU 后变成一组"阀门值",控制信息放行多少
+//   hb2(W3路) = 数据路 up  :被控制的"数据本身"
+//
+// 【直觉:一排水龙头】把数据 hb2 当"水",把 silu(hb) 当"每个龙头开多大":
+//     数据 hb2:     [d0,   d1,   d2,  ...]   ← 要传递的数据(水)
+//                    ×     ×     ×            逐元素相乘
+//     门 silu(hb):  [0.9,  0.1,  0.5, ...]   ← 每个位置开多大(模型按输入算出)
+//     ───────────────────────────────────
+//     输出:        [0.9d0,0.1d1,0.5d2,...]   ← 门开大→放行;门关小→压制
+//                    全通过  几乎挡 通过一半
+//   效果:模型根据输入【动态挑重点】——重要的信息让它过,无关的压掉。
+//   这就是 SwiGLU 比普通 FFN(单路+ReLU)强的地方:多了一路智能"门控"。
+//
+// 【SiLU 为何当门】silu(x)=x·sigmoid(x) 是"平滑可调的旋钮"(不是硬开关 0/1):
+//     x 很负→≈0(关) ; x=0→0 ; x 正大→≈x(大开甚至放大) ; 中间→平滑过渡
+//
+// 【GPU 实现】逐元素型:一个线程算一个位置 i(共 hidden_dim=768 个),无需通信。
+//     <<<⌈768/256⌉=3, 256>>>
+// ============================================================================
 #ifdef USE_CUDA
 __global__ void f_silu_elementwise_mul_w3_kernel(float *shb, float *shb2, int hidden_dim) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // 一个线程负责一个位置 i
     if (i < hidden_dim) {
-        float val = shb[i];
-        // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+        float val = shb[i];                 // val = hb[i](门控路 W1 的值)
+        // silu(x)=x*σ(x):把 hb[i] 变成"阀门值"(σ=sigmoid=1/(1+e^-x))
         val *= (1.0f / (1.0f + expf(-val)));
-        // elementwise multiply with w3(x)
+        // 逐元素乘上数据路 hb2[i]:门 × 数据 = 被门调节后的数据
         val *= shb2[i];
-        shb[i] = val;
+        shb[i] = val;                       // 原地写回 hb(结果给第10步 W2 降维)
     }
 }
 void f_silu_elementwise_mul_w3(RunState *s, int hidden_dim) {
@@ -1245,7 +1268,8 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->hb,  s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);   // xb→hb  (gate, 288→768)
         matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);   // xb→hb2 (up,   288→768)
 
-        // SwiGLU non-linearity
+        // 第 9 步:SwiGLU 激活 = silu(hb) ⊙ hb2(逐元素相乘,结果原地写回 hb)。
+        //   门控路 silu(hb) 当"阀门"调节数据路 hb2 → 模型按输入动态挑重点。详见 kernel 注释。
         f_silu_elementwise_mul_w3(s, hidden_dim);
 
         // final matmul to get the output of the ffn
