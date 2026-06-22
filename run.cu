@@ -1320,17 +1320,37 @@ float* forward(Transformer* transformer, int token, int pos) {
         accum(x, s->xb, dim);   // x = x + FFN结果
     }
 
-    // final rmsnorm
+    // ##############################################################################
+    // ## 收尾/输出阶段(在 6 层循环【之外】,只执行一次):final norm → lm_head → 返回   ##
+    // ##############################################################################
+    //   词嵌入 →[6层 decoder layer]→ x →【final RMSNorm → lm_head】→ logits → 采样 → 下一个词
+    //                  理解上下文                     ↑ 这里,负责"预测输出"
+    //
+    // ===== final RMSNorm =========================================================
+    // 【在做什么】6 层全走完后,把最终隐藏状态 x 再归一化一次,为送进 lm_head 做准备。
+    //   输入/输出都是 x[288](原地覆盖!层内norm写到xb保留x,这里不必了——后面不再有残差)。
+    // 【权重】rms_final_weight:288维向量,【全模型唯一一个】(不像 rms_att/ffn 每层一个)。
+    // 【对每层输出的要求】final norm 默认拿到的是"288维、且经残差累积的完整 x"——这正是
+    //   每层都把输出压回288维(FFN的W2降维、注意力的Wo投影)的原因:保证6层后能无缝接上。
+    //   x(6层加工后)─rmsnorm(× rms_final_weight)─► x(归一化,原地)─► 送 lm_head
     rmsnorm(x, x, w->rms_final_weight, dim);
 
-    // classifier into logits
+    // ===== lm_head(分类头,代码里叫 wcls)=========================================
+    // 【在做什么】forward 的最后一次、也是最大的一次矩阵乘:把 x[288] 投影到词表维度,
+    //   得到每个词的"分数"。lm_head = Language Model Head(语言模型输出头)。
+    //   x[288] ──wcls[32000×288]──► logits[32000]   词表每个词一个分数,越高=越可能是下一个词
+    // 【输入】x[288](final norm后) 【权重】wcls(32000×288) 【输出】logits[32000]
+    // 【weight tying】本模型 wcls 与输入端 token_embedding 共享同一块权重("词→向量"与
+    //   "向量→词"互逆,共享省35MB、效果也好;见 read_checkpoint 的 shared_weights)。
+    // 【为何在循环外只做一次】只需对"最终的 x"预测一次下一个词;不像 QKV/FFN 每层都做。
 #ifdef USE_CUDA
-    matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size);
+    matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size);   // 288 → 32000(GPU上算)
+    // logits 拷回 CPU:采样在 CPU 做(见 sample())。这是 forward 唯一的设备→主机回传。
     CUCHK(cudaMemcpy(s->logits, s->logits_gpu, p->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
 #else
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
-#endif 
-    return s->logits;
+#endif
+    return s->logits;   // 返回 logits[32000] → generate() 里交给 sample() 选下一个 token
 }
 
 // ----------------------------------------------------------------------------
