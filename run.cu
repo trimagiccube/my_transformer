@@ -1201,8 +1201,20 @@ float* forward(Transformer* transformer, int token, int pos) {
         //   ③ 原始信息不丢:就算这次计算没用(结果≈0),x 也原样传下去。
         accum(x, s->xb2, dim);                                 // x = x + xb2
 
-        // ffn rmsnorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+        // ===== 第 7 步:FFN 前的 RMSNorm(Pre-Norm)=====================================
+        // 【在做什么】进入前馈网络(FFN)之前,先把 x 归一化。和第①步的注意力前 RMSNorm
+        //   完全一样(同一 kernel),只是位置在 FFN 之前、用本层的 rms_ffn_weight。
+        //   体现 Pre-Norm:每次大计算(注意力/FFN)前都先归一化以稳定数值。
+        //
+        // 【输入】x[288]   :注意力残差后的隐藏状态(刚被 x=x+xb2 更新过)
+        //         rms_ffn_weight + l*dim : 本层 FFN 的归一化增益[288](每层独立)
+        // 【输出】xb[288]  :归一化结果,作为下面 FFN 的输入(x 本身不动)
+        //
+        //   x(注意力残差后)
+        //     │ rmsnorm(× rms_ffn_weight)        ← x 不被覆盖(FFN后的残差还要用原始x)
+        //     ▼
+        //   xb ──► 喂给 FFN(W1/W3 升维 → SwiGLU → W2 降维)
+        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);   // x → xb(FFN 输入)
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
