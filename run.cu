@@ -1216,10 +1216,29 @@ float* forward(Transformer* transformer, int token, int pos) {
         //   xb ──► 喂给 FFN(W1/W3 升维 → SwiGLU → W2 降维)
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);   // x → xb(FFN 输入)
 
-        // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-        // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+        // ===== 第 8 步:FFN 升维(W1、W3 两路并行投影)=================================
+        // 【在做什么】把归一化后的 xb[288] 用【两个不同的矩阵】W1、W3 各做一次矩阵乘,
+        //   都从 288 升到 768 维 → 得到两个中间向量 hb、hb2。
+        // 【目的】为下一步 SwiGLU 准备两路输入(SwiGLU = silu(hb) ⊙ hb2):
+        //     hb (W1路) = "门控路 gate":马上过 SiLU 当"开关/调节信号"
+        //     hb2(W3路) = "数据路 up"  :保留的投影数据本身
+        // 【为什么升维】FFN 先把向量投到更宽的空间(288→768)做非线性变换,再压回(第10步W2)。
+        //   更宽的空间能表达更复杂的特征模式。
+        // 【在 layer 中的角色】FFN 是 decoder layer 的后半:注意力让 token 间交流信息,
+        //   FFN 对【每个 token 独立】做非线性深加工(不看别的 token),增强表达/记忆能力。
+        //
+        // 【输入/输出】
+        //   1221: xb[288] ──W1[768×288]──► hb[768]   (门控路 gate)
+        //   1222: xb[288] ──W3[768×288]──► hb2[768]  (数据路 up)
+        //   (同一个输入 xb,乘两个不同权重;W1/W3 每层独立,+l*dim*hidden_dim 定位本层)
+        //
+        //          ┌─ W1·xb → hb [768]  gate ┐
+        //   xb[288]┤                          ├─► 下一步 ⑨: silu(hb) ⊙ hb2
+        //          └─ W3·xb → hb2[768]  up   ┘
+        //
+        // PyTorch 等价: self.w2(F.silu(self.w1(x)) * self.w3(x)) —— 这两行算 w1(x)、w3(x)
+        matmul(s->hb,  s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);   // xb→hb  (gate, 288→768)
+        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);   // xb→hb2 (up,   288→768)
 
         // SwiGLU non-linearity
         f_silu_elementwise_mul_w3(s, hidden_dim);
