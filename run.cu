@@ -1301,8 +1301,19 @@ float* forward(Transformer* transformer, int token, int pos) {
         //   门控路 silu(hb) 当"阀门"调节数据路 hb2 → 模型按输入动态挑重点。详见 kernel 注释。
         f_silu_elementwise_mul_w3(s, hidden_dim);
 
-        // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+        // ===== 第 10 步:FFN 降维(W2)=================================================
+        // 【在做什么】把 SwiGLU 结果 hb[768] 用 W2 矩阵降回主干维度 288 → FFN 的最终输出。
+        //   hb[768] ──W2[288×768]──► xb[288]
+        // 【输入/输出】
+        //   s->hb               = 输入:SwiGLU 结果(silu(hb)⊙hb2)[768]
+        //   w->w2 + l*dim*hidden_dim = 权重:本层 W2 矩阵[288×768](每层独立)
+        //   hidden_dim(768)=n 输入维, dim(288)=d 输出维 → d<n 即【降维】
+        //   s->xb               = 输出:FFN 最终结果[288],准备残差加回 x
+        // 【目的】主干 x 一直是 288 维;FFN 内部临时胖到 768 做了非线性加工,这里必须压回 288,
+        //   否则没法和 288 维的主干 x 相加(残差就断了)。
+        // 【与⑧升维是一对】⑧:288→768(进宽空间做变换);⑩:768→288(还原以便残差)。
+        //   一胖一瘦夹着 SwiGLU = FFN "升维→非线性→降维"的完整套路。算完 FFN 本体即结束。
+        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);   // hb→xb (down, 768→288)
 
         // 残差连接(同第6步):把 FFN 结果加回原始 x。x = x + FFN输出。
         //   一层里共两次残差:注意力后一次、FFN 后一次。x 一路被加着精炼 → 进下一层。
