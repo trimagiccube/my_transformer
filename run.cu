@@ -1351,6 +1351,18 @@ float* forward(Transformer* transformer, int token, int pos) {
     // 【weight tying】本模型 wcls 与输入端 token_embedding 共享同一块权重("词→向量"与
     //   "向量→词"互逆,共享省35MB、效果也好;见 read_checkpoint 的 shared_weights)。
     // 【为何在循环外只做一次】只需对"最终的 x"预测一次下一个词;不像 QKV/FFN 每层都做。
+    // 【matmul 各参数】matmul(xout, x, w, n, d):
+    //   s->logits_gpu = xout : 输出,词表每个词的分数 logits[32000](显存)
+    //   x             = x    : 输入,final norm 后的隐藏状态 [288]
+    //   w->wcls       = w    : lm_head 权重 [32000×288](每一行 = 词表里一个词的特征)
+    //   p->dim(288)   = n    : 输入维度
+    //   p->vocab_size(32000)=d: 输出维度(288→32000,forward 里最大的一次矩阵乘≈920万乘加)
+    // 【本质】logits[i] = wcls第i行 · x = "词i的特征" 与 "当前隐藏状态x" 的点积(相似度):
+    //   哪个词的特征和 x 越接近 → 它的 logit 越高 → 模型越倾向选它当下一个词。
+    //        wcls(32000行×288)   x[288]      logits[32000]
+    //        行0=词0的权重 ─·─┐  │  │  ──► s0=词0分数
+    //        行1=词1的权重    ├─►│  │      s1=词1分数
+    //        ...每行一个词    │  │  │      ...
 #ifdef USE_CUDA
     matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size);   // 288 → 32000(GPU上算)
     // logits 拷回 CPU:采样在 CPU 做(见 sample())。这是 forward 唯一的设备→主机回传。
