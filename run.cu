@@ -1788,13 +1788,21 @@ int sample(Sampler* sampler, float* logits) {
         softmax(logits, sampler->vocab_size);
         // flip a (float) coin (this is our source of entropy for sampling)
         float coin = random_f32(&sampler->rng_state);
+        // ---- 最后一步分流:此刻已有 概率分布 + 随机数 coin,按 topp 选用哪种随机采样 ----
+        //   topp 来自命令行 -p,是 top-p 核采样的开关:
+        //     topp <= 0 或 >= 1(关闭)→ sample_mult :在【全部32000词】里按概率抽,
+        //                                            长尾冷门词也有机会(可能不通顺)
+        //     0 < topp < 1(开启,如0.9)→ sample_topp:先把词按概率排序、累加到超过 topp,
+        //                                            只保留这批"高概率核"、其余清零,在核里抽
+        //                                            → 砍掉长尾冷门词,质量更稳又保留多样性
+        //   两者都用 coin 在(各自的)概率分布里"轮盘赌"选中一个词。
         // we sample from this distribution to get the next token
         if (sampler->topp <= 0 || sampler->topp >= 1) {
             // simply sample from the predicted probability distribution
-            next = sample_mult(logits, sampler->vocab_size, coin);
+            next = sample_mult(logits, sampler->vocab_size, coin);          // 全词表按概率抽
         } else {
             // top-p (nucleus) sampling, clamping the least likely tokens to zero
-            next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
+            next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);  // 核内抽
         }
     }
     return next;
