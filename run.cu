@@ -1748,6 +1748,33 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
+// ============================================================================
+// sample:从 lm_head 算出的 logits[32000] 里【选出一个 token】(下一个词)。
+//
+// 【出入参】
+//   入参 sampler : 采样器,装着参数和状态 —— temperature(随机程度)、topp(核采样阈值)、
+//                  rng_state(随机种子)、vocab_size(32000)、probindex(top-p排序缓冲)
+//   入参 logits  : lm_head 输出的 32000 个分数(词表每个词一个)
+//   返回 next    : 一个 int = 选中的 token id(0..31999)= 下一个词
+//
+//     logits[32000] + sampler ──► sample() ──► next(一个token id,如9038)
+//
+// 【temperature 干啥】控制随机程度/创造性的"旋钮"。做法:logits 先 ÷temperature 再 softmax,
+//   改变分数差距 → 改变概率分布的尖锐度:
+//     ÷小温(0.5):差距拉大→概率更尖锐→几乎总选最高分(保守、稳定)
+//     ÷大温(1.5):差距缩小→概率更平均→冷门词也可能中(发散、有创意)
+//     =1.0:原始分布   =0:特例,走 argmax 直接选最高分(不做除法,避免除零)
+//
+// 【调 sample 前必须 ready 的前置条件】
+//   ① build_sampler 已初始化 sampler(temperature/topp/种子/缓冲)—— 启动时一次
+//   ② forward 已跑完 → logits[32000] 算好(sample 不算分数,只从已有分数里选)
+//   ③ logits 已从显存 cudaMemcpy 回【CPU】(sample 是纯 CPU 函数,读主机内存)
+//
+// 【三条路】(下面代码)
+//   temperature==0 ─► argmax(选最高分,确定)
+//   否则 ÷温度→softmax→掷骰子 ─┬─ topp 关 ─► 全词表按概率随机抽(sample_mult)
+//                              └─ topp 开 ─► 只在高概率核里抽(sample_topp)
+// ============================================================================
 int sample(Sampler* sampler, float* logits) {
     // sample the token given the logits and some hyperparameters
     int next;
