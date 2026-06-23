@@ -1681,6 +1681,27 @@ int compare(const void* a, const void* b) {
     return 0;
 }
 
+// ============================================================================
+// top-p(nucleus,核采样):只在"累积概率达到 topp 的最小一批高概率词"里抽,砍掉长尾。
+//   好处:绝不抽到概率极低的离谱词,质量更稳;且保留几个词由分布自适应(比固定个数的
+//   top-k 更聪明:模型确定时只留少数,不确定时自动多留)。
+//
+// 【缩小例子】词表只 5 个词,概率 A=0.5 B=0.2 C=0.15 D=0.1 E=0.05,topp=0.8,coin=0.6:
+//   ① 降序排序:A=0.5 B=0.2 C=0.15 D=0.1 E=0.05(本例已降序)
+//   ② 累加找核,到第一次 ≥ topp 为止:0.5→0.7→0.85 ✓(到 C 够 0.8)
+//        核 = {A,B,C}(留),{D,E}(砍掉长尾)
+//   ③④ 在核里用 coin 轮盘赌(coin 乘以核的累积和 = 等效"核内归一化"):
+//        r = coin*0.85 = 0.51;核内累加 A:0.5  B:0.7 → r<0.7 → 选中【B】
+//
+//        核:    A          B        C
+//        线段:├────────┤├──────┤├────┤    coin 落点决定选哪个;
+//              0      0.5      0.7  0.85   D、E 在 0.85 之外,绝不会被选
+//
+//   对比全词表采样(sample_mult):D、E 也参与,偶尔抽到 0.05 的冷门词;top-p 把它们砍掉。
+//
+// 【代码4步】下面对应:先剪枝(cutoff加速)→ qsort降序 → 累加找核(last_idx)→ coin轮盘赌。
+//   topp 来自命令行 -p;coin 是 random_f32() 给的 [0,1) 随机数。
+// ============================================================================
 int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, float coin) {
     // top-p sampling (or "nucleus sampling") samples from the smallest set of
     // tokens that exceed probability topp. This way we never sample tokens that
@@ -1688,6 +1709,7 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
     // coin is a random number in [0, 1), usually from random_f32()
 
     int n0 = 0;
+    // ① 剪枝优化:概率小于 cutoff 的词肯定进不了核,先剔除以减少排序量(纯加速,不影响结果)
     // quicksort indices in descending order of probabilities
     // values smaller than (1 - topp) / (n - 1) cannot be part of the result
     // so for efficiency we crop these out as candidates before sorting
@@ -1699,8 +1721,9 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
             n0++;
         }
     }
-    qsort(probindex, n0, sizeof(ProbIndex), compare);
+    qsort(probindex, n0, sizeof(ProbIndex), compare);   // ② 按概率降序排序
 
+    // ③ 累加找核:到累积概率第一次 > topp 的位置(last_idx)为止,后面的全砍掉
     // truncate the list where cumulative probability exceeds topp
     float cumulative_prob = 0.0f;
     int last_idx = n0 - 1; // in case of rounding errors consider all elements
@@ -1712,6 +1735,7 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
         }
     }
 
+    // ④ 在核里用 coin 轮盘赌:r = coin×核累积和(等效核内归一化),落在哪个词区间就选它
     // sample from the truncated list
     float r = coin * cumulative_prob;
     float cdf = 0.0f;
